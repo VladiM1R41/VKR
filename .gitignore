@@ -30,7 +30,6 @@ logs/
 # Локальные runtime-артефакты
 celerybeat-schedule*
 test_artifacts/
-.qwen/
 
 # Временные файлы
 tmp_*
@@ -44,3 +43,10 @@ htmlcov/
 
 # Docker volumes (локальные)
 pgdata/
+
+
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+web/openapi.json
+generated_audio/

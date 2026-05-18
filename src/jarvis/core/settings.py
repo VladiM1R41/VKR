@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     processing_batch_size: int = Field(default=16, alias="PROCESSING_BATCH_SIZE")
     processing_tick_seconds: int = Field(default=60, alias="PROCESSING_TICK_SECONDS")
     processing_lock_ttl_seconds: int = Field(default=900, alias="PROCESSING_LOCK_TTL_SECONDS")
+    processing_analytics_max_articles: int = Field(default=0, alias="PROCESSING_ANALYTICS_MAX_ARTICLES")
+    processing_embedding_backend: str = Field(default="auto", alias="PROCESSING_EMBEDDING_BACKEND")
 
     jarvis_llm_provider: str = Field(default="gigachat", alias="JARVIS_LLM_PROVIDER")
     jarvis_llm_model: str = Field(default="gigachat-max", alias="JARVIS_LLM_MODEL")
@@ -55,6 +57,8 @@ class Settings(BaseSettings):
     gigachat_auth_key: str | None = Field(default=None, alias="GIGACHAT_AUTH_KEY")
     gigachat_base_url: str | None = Field(default=None, alias="GIGACHAT_BASE_URL")
     gigachat_scope: str = Field(default="GIGACHAT_API_PERS", alias="GIGACHAT_SCOPE")
+    gigachat_tls_verify: bool = Field(default=True, alias="GIGACHAT_TLS_VERIFY")
+    gigachat_ca_bundle: str | None = Field(default=None, alias="GIGACHAT_CA_BUNDLE")
     yandexgpt_api_key: str | None = Field(default=None, alias="YandexGPT_API_KEY")
     yandexgpt_base_url: str | None = Field(default=None, alias="YandexGPT_BASE_URL")
 
@@ -77,6 +81,12 @@ class Settings(BaseSettings):
             raise ValueError("PROCESSING_TICK_SECONDS must be positive.")
         if self.processing_lock_ttl_seconds <= 0:
             raise ValueError("PROCESSING_LOCK_TTL_SECONDS must be positive.")
+        if self.processing_analytics_max_articles < 0:
+            raise ValueError("PROCESSING_ANALYTICS_MAX_ARTICLES must be non-negative.")
+        if self.processing_embedding_backend not in {"auto", "flagembedding", "sentence-transformers"}:
+            raise ValueError(
+                "PROCESSING_EMBEDDING_BACKEND must be one of: auto, flagembedding, sentence-transformers."
+            )
         if self.jarvis_llm_timeout_sec <= 0:
             raise ValueError("JARVIS_LLM_TIMEOUT_SEC must be positive.")
         if self.jarvis_llm_retry_attempts < 0:
@@ -87,6 +97,8 @@ class Settings(BaseSettings):
             raise ValueError("JARVIS_LLM_MAX_OUTPUT_TOKENS must be positive.")
         if not 0.0 <= self.jarvis_llm_temperature <= 2.0:
             raise ValueError("JARVIS_LLM_TEMPERATURE must stay between 0.0 and 2.0.")
+        if self.app_env.strip().lower() in {"prod", "production"} and not self.gigachat_tls_verify:
+            raise ValueError("GIGACHAT_TLS_VERIFY cannot be disabled in production.")
         return self
 
     @property
