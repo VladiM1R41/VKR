@@ -1,158 +1,266 @@
-"""GET /news/{id}, GET /news/{id}/related — детали и связанные новости."""
+"""News feed and article endpoints."""
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import Select, case, desc, func, select
 from sqlalchemy.orm import Session
 
-from jarvis.app.dependencies import get_db
-from jarvis.db.models import (
-    Chunk,
-    Entity,
-    News,
-    NewsEntity,
-    NewsTopic,
-    Source,
-    Topic,
+from jarvis.app.dependencies import get_current_user_id, get_db
+from jarvis.app.schemas.common import EntityView, PageMeta, SourceBrief, TopicView
+from jarvis.app.schemas.news import (
+    NewsDetail,
+    NewsFeedResponse,
+    NewsSourceFilterItem,
+    NewsSourceFiltersResponse,
+    NewsSummary,
+    NewsTopicFilterItem,
+    NewsTopicFiltersResponse,
+    RelatedNewsResponse,
 )
+from jarvis.db.models import Chunk, Entity, News, NewsEntity, NewsTopic, Source, Topic, UserSourcePreference
 
-router = APIRouter(prefix="/news", tags=["News"])
-
-
-# ── Schemas ───────────────────────────────────────────────────────────────────
-
-class NewsDetailOut(BaseModel):
-    id: int
-    title: str
-    content: Optional[str]
-    snippet_lead: Optional[str]
-    url: Optional[str]
-    source_id: int
-    source_name: str
-    published_at: Optional[datetime]
-    language: str
-    information_type: Optional[str]
-    urgency: Optional[str]
-    content_grade: Optional[int]
-    entities: list[str]
-    topics: list[str]
-    chunk_count: int
-    event_cluster_id: Optional[int]
+router = APIRouter()
 
 
-class RelatedNewsOut(BaseModel):
-    id: int
-    title: str
-    source_name: str
-    published_at: Optional[datetime]
-    snippet_lead: Optional[str]
-
-
-class RelatedNewsListOut(BaseModel):
-    items: list[RelatedNewsOut]
-    cluster_id: Optional[int]
-
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@router.get(
-    "/{news_id}",
-    response_model=NewsDetailOut,
-    summary="Детали новости",
-    description="Возвращает полную информацию о новости: текст, сущности, темы, чанки.",
-)
-def get_news(news_id: int, db: Session = Depends(get_db)) -> NewsDetailOut:
-    news = db.get(News, news_id)
-    if news is None:
-        raise HTTPException(status_code=404, detail="Новость не найдена")
-
-    source = db.get(Source, news.source_id)
-    source_name = source.name if source else "Unknown"
-
-    entity_ids = db.scalars(
-        select(NewsEntity.entity_id).where(NewsEntity.news_id == news_id)
-    ).all()
-    entity_names = []
-    if entity_ids:
-        entity_names = list(
-            db.scalars(select(Entity.name).where(Entity.id.in_(entity_ids))).all()
-        )
-
-    topic_ids = db.scalars(
-        select(NewsTopic.topic_id).where(NewsTopic.news_id == news_id)
-    ).all()
-    topic_names = []
-    if topic_ids:
-        topic_names = list(
-            db.scalars(select(Topic.name).where(Topic.id.in_(topic_ids))).all()
-        )
-
-    chunk_count = db.scalar(
-        select(__import__("sqlalchemy", fromlist=["func"]).func.count())
-        .select_from(Chunk)
-        .where(Chunk.news_id == news_id)
-    ) or 0
-
-    return NewsDetailOut(
-        id=int(news.id),
-        title=str(news.title),
-        content=news.content,
-        snippet_lead=news.snippet_lead,
-        url=news.canonical_url,
-        source_id=int(news.source_id),
-        source_name=source_name,
-        published_at=news.published_at,
-        language=str(news.language or "ru"),
-        information_type=news.information_type,
-        urgency=news.urgency,
-        content_grade=news.content_grade,
-        entities=list(entity_names),
-        topics=list(topic_names),
-        chunk_count=int(chunk_count),
-        event_cluster_id=news.event_cluster_id,
+def _source_view(source: Source) -> SourceBrief:
+    return SourceBrief(
+        id=source.id,
+        name=source.name,
+        type=source.type,
+        url=source.url,
+        health_status=source.health_status,
+        trust_score=source.trust_score,
     )
 
 
-@router.get(
-    "/{news_id}/related",
-    response_model=RelatedNewsListOut,
-    summary="Связанные новости",
-    description="Новости из того же событийного кластера (event_cluster_id) из разных источников.",
-)
-def get_related(
+def _load_topics(session: Session, news_ids: list[int]) -> dict[int, list[TopicView]]:
+    if not news_ids:
+        return {}
+    stmt = (
+        select(NewsTopic.news_id, Topic.id, Topic.name, NewsTopic.confidence)
+        .join(Topic, Topic.id == NewsTopic.topic_id)
+        .where(NewsTopic.news_id.in_(news_ids))
+    )
+    result: dict[int, list[TopicView]] = {news_id: [] for news_id in news_ids}
+    for news_id, topic_id, name, confidence in session.execute(stmt):
+        result.setdefault(news_id, []).append(TopicView(id=topic_id, name=name, confidence=confidence))
+    return result
+
+
+def _load_entities(session: Session, news_ids: list[int]) -> dict[int, list[EntityView]]:
+    if not news_ids:
+        return {}
+    stmt = (
+        select(NewsEntity.news_id, Entity.id, Entity.name, Entity.type, Entity.normalized_name, NewsEntity.mention_count)
+        .join(Entity, Entity.id == NewsEntity.entity_id)
+        .where(NewsEntity.news_id.in_(news_ids))
+    )
+    result: dict[int, list[EntityView]] = {news_id: [] for news_id in news_ids}
+    for news_id, entity_id, name, entity_type, normalized_name, mention_count in session.execute(stmt):
+        result.setdefault(news_id, []).append(
+            EntityView(
+                id=entity_id,
+                name=name,
+                type=entity_type,
+                normalized_name=normalized_name,
+                mention_count=mention_count,
+            )
+        )
+    return result
+
+
+def _summary(news: News, source: Source, topics: list[TopicView], entities: list[EntityView]) -> NewsSummary:
+    return NewsSummary(
+        id=news.id,
+        title=news.title,
+        snippet=news.snippet_lead or (news.content[:280] if news.content else None),
+        source=_source_view(source),
+        url=news.url,
+        published_at=news.published_at,
+        ingested_at=news.ingested_at,
+        content_grade=news.content_grade,
+        information_type=news.information_type,
+        urgency=news.urgency,
+        is_uncertain=news.is_uncertain,
+        processed=news.processed,
+        topics=topics,
+        entities=entities,
+    )
+
+
+def _apply_feed_filters(
+    stmt: Select[tuple[News, Source]],
+    *,
+    source_id: int | None,
+    source_ids: list[int] | None,
+    topic: str | None,
+    date_from: datetime | None,
+    date_to: datetime | None,
+    content_grade_max: int | None,
+    processed_only: bool,
+) -> Select[tuple[News, Source]]:
+    if source_id is not None:
+        stmt = stmt.where(News.source_id == source_id)
+    elif source_ids:
+        stmt = stmt.where(News.source_id.in_(sorted(set(source_ids))))
+    if date_from is not None:
+        stmt = stmt.where(News.published_at >= date_from)
+    if date_to is not None:
+        stmt = stmt.where(News.published_at <= date_to)
+    if content_grade_max is not None:
+        stmt = stmt.where(News.content_grade <= content_grade_max)
+    if processed_only:
+        stmt = stmt.where(News.processed.is_(True))
+    if topic:
+        stmt = stmt.join(NewsTopic, NewsTopic.news_id == News.id).join(Topic, Topic.id == NewsTopic.topic_id)
+        stmt = stmt.where(Topic.name == topic)
+    return stmt
+
+
+def _load_source_preferences(session: Session, user_id: int) -> tuple[set[int], set[int]]:
+    rows = session.scalars(
+        select(UserSourcePreference).where(UserSourcePreference.user_id == user_id)
+    ).all()
+    preferred = {int(row.source_id) for row in rows if row.preference == "preferred"}
+    blocked = {int(row.source_id) for row in rows if row.preference == "blocked"}
+    return preferred, blocked
+
+
+@router.get("/feed", response_model=NewsFeedResponse)
+def get_news_feed(
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    source_id: int | None = None,
+    source_ids: list[int] | None = Query(None),
+    topic: str | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+    content_grade_max: int | None = Query(None, ge=1, le=6),
+    processed_only: bool = False,
+    personalized: bool = True,
+) -> NewsFeedResponse:
+    base = select(News, Source).join(Source, Source.id == News.source_id)
+    filtered = _apply_feed_filters(
+        base,
+        source_id=source_id,
+        source_ids=source_ids,
+        topic=topic,
+        date_from=date_from,
+        date_to=date_to,
+        content_grade_max=content_grade_max,
+        processed_only=processed_only,
+    )
+    preferred_source_ids: set[int] = set()
+    if personalized:
+        preferred_source_ids, blocked_source_ids = _load_source_preferences(session, user_id)
+        if blocked_source_ids and source_id is None and not source_ids:
+            filtered = filtered.where(News.source_id.not_in(blocked_source_ids))
+
+    total = session.scalar(select(func.count()).select_from(filtered.subquery())) or 0
+    source_priority = case((News.source_id.in_(preferred_source_ids), 1), else_=0)
+    rows = session.execute(
+        filtered.order_by(
+            desc(News.published_at).nullslast(),
+            desc(News.ingested_at),
+            desc(source_priority),
+        )
+        .limit(limit)
+        .offset(offset)
+    ).all()
+    news_ids = [row[0].id for row in rows]
+    topics = _load_topics(session, news_ids)
+    entities = _load_entities(session, news_ids)
+    items = [_summary(news, source, topics.get(news.id, []), entities.get(news.id, [])) for news, source in rows]
+    return NewsFeedResponse(items=items, meta=PageMeta(limit=limit, offset=offset, total=total))
+
+
+@router.get("/sources", response_model=NewsSourceFiltersResponse)
+def get_news_sources(session: Session = Depends(get_db)) -> NewsSourceFiltersResponse:
+    total_counts = dict(
+        session.execute(select(News.source_id, func.count()).group_by(News.source_id)).all()
+    )
+    processed_counts = dict(
+        session.execute(
+            select(News.source_id, func.count()).where(News.processed.is_(True)).group_by(News.source_id)
+        ).all()
+    )
+    sources = session.scalars(select(Source).order_by(Source.name)).all()
+    return NewsSourceFiltersResponse(
+        items=[
+            NewsSourceFilterItem(
+                **_source_view(source).model_dump(),
+                news_count=int(total_counts.get(source.id, 0)),
+                processed_count=int(processed_counts.get(source.id, 0)),
+            )
+            for source in sources
+        ]
+    )
+
+
+@router.get("/topics", response_model=NewsTopicFiltersResponse)
+def get_news_topics(session: Session = Depends(get_db)) -> NewsTopicFiltersResponse:
+    rows = session.execute(
+        select(Topic.id, Topic.name, func.count(NewsTopic.news_id))
+        .join(NewsTopic, NewsTopic.topic_id == Topic.id)
+        .group_by(Topic.id, Topic.name)
+        .order_by(func.count(NewsTopic.news_id).desc(), Topic.name)
+    ).all()
+    return NewsTopicFiltersResponse(
+        items=[NewsTopicFilterItem(id=topic_id, name=name, news_count=int(count)) for topic_id, name, count in rows]
+    )
+
+
+@router.get("/{news_id}", response_model=NewsDetail)
+def get_news(news_id: int, session: Session = Depends(get_db)) -> NewsDetail:
+    row = session.execute(
+        select(News, Source).join(Source, Source.id == News.source_id).where(News.id == news_id)
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="News item not found")
+    news, source = row
+    topics = _load_topics(session, [news.id]).get(news.id, [])
+    entities = _load_entities(session, [news.id]).get(news.id, [])
+    chunk_count = session.scalar(select(func.count()).select_from(Chunk).where(Chunk.news_id == news.id)) or 0
+    base = _summary(news, source, topics, entities).model_dump()
+    return NewsDetail(
+        **base,
+        content=news.content,
+        canonical_url=news.canonical_url,
+        language=news.language,
+        content_status=news.content_status,
+        extraction_method=news.extraction_method,
+        event_cluster_id=news.event_cluster_id,
+        chunk_count=chunk_count,
+        extra=dict(news.extra or {}),
+    )
+
+
+@router.get("/{news_id}/related", response_model=RelatedNewsResponse)
+def get_related_news(
     news_id: int,
-    limit: int = 5,
-    db: Session = Depends(get_db),
-) -> RelatedNewsListOut:
-    news = db.get(News, news_id)
+    session: Session = Depends(get_db),
+    limit: int = Query(5, ge=1, le=30),
+) -> RelatedNewsResponse:
+    news = session.get(News, news_id)
     if news is None:
-        raise HTTPException(status_code=404, detail="Новость не найдена")
-
-    cluster_id = news.event_cluster_id
-    if cluster_id is None:
-        return RelatedNewsListOut(items=[], cluster_id=None)
-
-    rows = db.scalars(
-        select(News)
-        .where(News.event_cluster_id == cluster_id, News.id != news_id)
-        .order_by(News.published_at.desc())
+        raise HTTPException(status_code=404, detail="News item not found")
+    if news.event_cluster_id is None:
+        return RelatedNewsResponse(items=[])
+    rows = session.execute(
+        select(News, Source)
+        .join(Source, Source.id == News.source_id)
+        .where(News.event_cluster_id == news.event_cluster_id, News.id != news_id)
+        .order_by(desc(News.published_at).nullslast(), desc(News.ingested_at))
         .limit(limit)
     ).all()
-
-    items = []
-    for r in rows:
-        source = db.get(Source, r.source_id)
-        items.append(RelatedNewsOut(
-            id=int(r.id),
-            title=str(r.title),
-            source_name=source.name if source else "Unknown",
-            published_at=r.published_at,
-            snippet_lead=r.snippet_lead,
-        ))
-
-    return RelatedNewsListOut(items=items, cluster_id=int(cluster_id))
+    ids = [item.id for item, _ in rows]
+    topics = _load_topics(session, ids)
+    entities = _load_entities(session, ids)
+    return RelatedNewsResponse(
+        items=[_summary(item, source, topics.get(item.id, []), entities.get(item.id, [])) for item, source in rows]
+    )

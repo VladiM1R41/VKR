@@ -1,195 +1,147 @@
-﻿"""GET /digest, /digest/audio, /digests."""
+"""Digest endpoints over Layer 4 shortlist and Layer 5 generation."""
 
 from __future__ import annotations
 
-import logging
-import os
-from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from sqlalchemy import func, select
+from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from jarvis.app.dependencies import get_db, get_default_user_id
-from jarvis.db.models import Digest, DigestItem
+from jarvis.app.api.v1.chat import _search_context
+from jarvis.app.dependencies import get_current_user_id, get_db
+from jarvis.app.schemas.digest import DigestGenerateRequest, DigestItemView, DigestListResponse, DigestResponse
+from jarvis.db.models import Digest, DigestItem, News
+from jarvis.generation.services.answer_generation_service import build_answer_generation_service
+from jarvis.generation.tasks.tts_tasks import generate_digest_audio_task
+from jarvis.personalization.services.digest_service import DigestOrchestrationService
 
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/digest", tags=["Digest"])
-
-_DIGEST_TYPE_ALIASES = {
-    "daily": "morning",
-    "breaking": "on_demand",
-    "analytics": "weekly",
-    "morning": "morning",
-    "evening": "evening",
-    "weekly": "weekly",
-    "on_demand": "on_demand",
-}
+router = APIRouter()
 
 
-class DigestOut(BaseModel):
-    digest_id: int
-    digest_type: str
-    content_text: str
-    item_count: int
-    generated_at: datetime
-    audio_url: str | None = None
-
-
-class DigestListItemOut(BaseModel):
-    digest_id: int
-    digest_type: str
-    item_count: int
-    generated_at: datetime
-    has_audio: bool
-
-
-class DigestListOut(BaseModel):
-    items: list[DigestListItemOut]
-    total: int
-
-
-def _normalize_digest_type(digest_type: str) -> str:
-    normalized = _DIGEST_TYPE_ALIASES.get(digest_type, digest_type)
-    if normalized not in {"morning", "evening", "weekly", "on_demand"}:
-        raise HTTPException(status_code=400, detail=f"Неподдерживаемый digest_type: {digest_type}")
-    return normalized
-
-
-def _count_items(db: Session, digest_id: int) -> int:
-    return int(
-        db.scalar(select(func.count()).select_from(DigestItem).where(DigestItem.digest_id == digest_id)) or 0
+def _digest_response(session: Session, digest: Digest) -> DigestResponse:
+    rows = session.execute(
+        select(DigestItem, News.title, News.url)
+        .join(News, News.id == DigestItem.news_id)
+        .where(DigestItem.digest_id == digest.id)
+        .order_by(DigestItem.position)
+    ).all()
+    return DigestResponse(
+        id=digest.id,
+        digest_type=digest.digest_type,
+        content_text=digest.content_text,
+        news_count=digest.news_count,
+        topics_covered=list(digest.topics_covered or []),
+        generation_log_id=digest.generation_log_id,
+        generated_at=digest.generated_at,
+        audio_path=digest.audio_path,
+        items=[
+            DigestItemView(news_id=item.news_id, position=item.position, snippet=item.snippet, title=title, url=url)
+            for item, title, url in rows
+        ],
     )
 
 
-def _build_digest(user_id: int, digest_type: str, db: Session) -> Digest:
-    """Build and persist a fresh digest via the current Layer 4 -> 5 pipeline."""
-    from jarvis.generation.services import AnswerGenerationService, GenerationConfig
-    from jarvis.generation.services.providers.factory import build_primary_provider
-    from jarvis.personalization.services.digest_service import DigestOrchestrationService
-    from jarvis.personalization.services.ranking_service import PersonalizedRankingService
-    from jarvis.retrieval.models.search_models import SearchRequest
-    from jarvis.retrieval.services.search_service import SearchService
-
-    search_service = SearchService()
-    l3_response = search_service.search(SearchRequest(query="главные новости сегодня", limit=20))
-
-    ranking_service = PersonalizedRankingService()
-    l4_response = ranking_service.rerank(db, user_id=user_id, response=l3_response)
-
-    digest_service = DigestOrchestrationService()
-    shortlist = digest_service.build_shortlist(
-        db,
+def _generate_digest(session: Session, user_id: int, request: DigestGenerateRequest) -> Digest:
+    _, l4_response, _ = _search_context(session, query=request.query, limit=request.limit, user_id=user_id)
+    shortlist = DigestOrchestrationService().build_shortlist(
+        session,
         user_id=user_id,
-        digest_type=digest_type,
+        digest_type=request.digest_type,
         ranked_response=l4_response,
-        limit=5,
+        limit=min(7, len(l4_response.results)),
     )
     if not shortlist.candidates:
-        raise RuntimeError("Не удалось собрать shortlist для дайджеста")
-
-    generation_service = AnswerGenerationService(
-        provider=build_primary_provider(),
-        config=GenerationConfig(),
+        raise HTTPException(status_code=404, detail="No candidates for digest")
+    text, generation_log_id = DigestOrchestrationService().generate_digest_text(
+        session,
+        shortlist,
+        generation_service=build_answer_generation_service(),
     )
-    digest_text, generation_log_id = digest_service.generate_digest_text(
-        db,
+    digest = DigestOrchestrationService().persist_shortlist(
+        session,
         shortlist=shortlist,
-        generation_service=generation_service,
-        continuity_context="",
-    )
-    return digest_service.persist_shortlist(
-        db,
-        shortlist=shortlist,
-        content_text=digest_text,
+        content_text=text,
         generation_log_id=generation_log_id,
     )
+    session.commit()
+    session.refresh(digest)
+    return digest
 
 
-@router.get("", response_model=DigestOut, summary="Текущий дайджест")
+@router.get("/api/v1/digest", response_model=DigestResponse)
 def get_digest(
-    digest_type: str = Query(
-        "daily",
-        description="daily / breaking / analytics / morning / evening / weekly / on_demand",
-    ),
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_default_user_id),
-) -> DigestOut:
-    requested_type = digest_type
-    digest_type = _normalize_digest_type(digest_type)
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
-    existing = db.scalar(
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+    digest_type: str = Query("on_demand", pattern="^(morning|evening|weekly|on_demand)$"),
+) -> DigestResponse:
+    digest = session.scalar(
         select(Digest)
-        .where(
-            Digest.user_id == user_id,
-            Digest.digest_type == digest_type,
-            Digest.generated_at >= today_start,
-        )
-        .order_by(Digest.generated_at.desc())
+        .where(Digest.user_id == user_id, Digest.digest_type == digest_type)
+        .order_by(desc(Digest.generated_at))
+        .limit(1)
     )
-
-    if existing is None or not existing.content_text:
-        try:
-            existing = _build_digest(user_id, digest_type, db)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.exception("Ошибка генерации дайджеста: %s", exc)
-            raise HTTPException(status_code=503, detail=f"Ошибка генерации дайджеста: {exc}")
-
-    return DigestOut(
-        digest_id=int(existing.id),
-        digest_type=requested_type,
-        content_text=str(existing.content_text or ""),
-        item_count=_count_items(db, int(existing.id)),
-        generated_at=existing.generated_at,
-        audio_url=existing.audio_path if existing.audio_path else None,
-    )
-
-
-@router.get("/audio", summary="Аудио-версия дайджеста")
-def get_digest_audio(
-    digest_id: int = Query(..., description="ID дайджеста"),
-    db: Session = Depends(get_db),
-) -> object:
-    digest = db.get(Digest, digest_id)
     if digest is None:
-        raise HTTPException(status_code=404, detail="Дайджест не найден")
-    if digest.audio_path and os.path.exists(digest.audio_path):
-        return FileResponse(digest.audio_path, media_type="audio/mpeg")
-
-    from jarvis.generation.tasks.tts_tasks import generate_digest_audio_task
-
-    generate_digest_audio_task.delay(digest_id)
-    return {"status": "accepted", "message": "Генерация аудио запущена", "digest_id": digest_id}
+        digest = _generate_digest(session, user_id, DigestGenerateRequest(digest_type=digest_type))
+    return _digest_response(session, digest)
 
 
-@router.get("s", response_model=DigestListOut, summary="Архив дайджестов")
+@router.post("/api/v1/digest/generate", response_model=DigestResponse)
+def generate_digest(
+    request: DigestGenerateRequest,
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> DigestResponse:
+    if not request.force:
+        existing = session.scalar(
+            select(Digest)
+            .where(Digest.user_id == user_id, Digest.digest_type == request.digest_type)
+            .order_by(desc(Digest.generated_at))
+            .limit(1)
+        )
+        if existing is not None:
+            return _digest_response(session, existing)
+    return _digest_response(session, _generate_digest(session, user_id, request))
+
+
+@router.get("/api/v1/digests", response_model=DigestListResponse)
 def list_digests(
-    limit: int = Query(10, ge=1, le=50),
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+    limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_default_user_id),
-) -> DigestListOut:
-    total = int(db.scalar(select(func.count()).select_from(Digest).where(Digest.user_id == user_id)) or 0)
-    rows = db.scalars(
+) -> DigestListResponse:
+    total = session.scalar(select(func.count()).select_from(Digest).where(Digest.user_id == user_id)) or 0
+    rows = session.scalars(
         select(Digest)
         .where(Digest.user_id == user_id)
-        .order_by(Digest.generated_at.desc())
+        .order_by(desc(Digest.generated_at))
         .limit(limit)
         .offset(offset)
     ).all()
-    items = [
-        DigestListItemOut(
-            digest_id=int(row.id),
-            digest_type=str(row.digest_type),
-            item_count=_count_items(db, int(row.id)),
-            generated_at=row.generated_at,
-            has_audio=bool(row.audio_path),
-        )
-        for row in rows
-    ]
-    return DigestListOut(items=items, total=total)
+    return DigestListResponse(
+        items=[_digest_response(session, row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/api/v1/digest/audio")
+def digest_audio(
+    digest_id: int,
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    digest = session.scalar(select(Digest).where(Digest.id == digest_id, Digest.user_id == user_id))
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Digest not found")
+    if digest.audio_path and Path(digest.audio_path).exists():
+        return FileResponse(digest.audio_path, media_type="audio/wav")
+    result = generate_digest_audio_task.run(digest_id)
+    if result.get("status") == "ok":
+        session.refresh(digest)
+        if digest.audio_path and Path(digest.audio_path).exists():
+            return FileResponse(digest.audio_path, media_type="audio/wav")
+    return JSONResponse(status_code=202, content={"status": result.get("status", "pending"), "detail": result})

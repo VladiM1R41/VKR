@@ -1,60 +1,44 @@
-"""POST /feedback — запись взаимодействия пользователя с новостью."""
+"""Feedback endpoint over Layer 4 interaction logging."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from jarvis.app.dependencies import get_db, get_default_user_id
+from jarvis.app.dependencies import get_current_user_id, get_db
+from jarvis.app.schemas.profile import FeedbackRequest, FeedbackResponse
+from jarvis.personalization.models.interaction_models import InteractionEventRequest
+from jarvis.personalization.services.interaction_service import InteractionLoggingService
+from jarvis.personalization.services.profile_update_service import ProfileUpdateService
 
-router = APIRouter(prefix="/feedback", tags=["Feedback"])
-
-VALID_ACTIONS = {"like", "dislike", "save", "hide", "click", "read_long", "click_short", "skip"}
-
-
-class FeedbackIn(BaseModel):
-    news_id: int
-    action: str
+router = APIRouter()
 
 
-class FeedbackOut(BaseModel):
-    recorded: bool
-    news_id: int
-    action: str
+@router.post("", response_model=FeedbackResponse)
+def feedback(
+    request: FeedbackRequest,
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> FeedbackResponse:
+    try:
+        event = InteractionEventRequest(
+            user_id=user_id,
+            news_id=request.news_id,
+            action=request.action,
+            dwell_time_sec=request.dwell_time_sec,
+            search_log_id=request.search_log_id,
+            session_id=request.session_id,
+        )
+        response = InteractionLoggingService().log_interaction(session, event)
+        ProfileUpdateService().update_from_interaction(session, response.interaction_id)
+        session.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-
-@router.post(
-    "",
-    response_model=FeedbackOut,
-    summary="Записать взаимодействие с новостью",
-    description="Фиксирует действие пользователя (like/dislike/save/hide/click/read_long). "
-                "Автоматически обновляет профиль пользователя через EMA-механизм Layer 4.",
-)
-def record_feedback(
-    body: FeedbackIn,
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_default_user_id),
-) -> FeedbackOut:
-    from jarvis.personalization.services.interaction_service import InteractionService
-    from jarvis.personalization.services.profile_update_service import ProfileUpdateService
-
-    action = body.action if body.action in VALID_ACTIONS else "click"
-
-    interaction_service = InteractionService()
-    interaction_service.record_interaction(
-        db,
-        user_id=user_id,
-        news_id=body.news_id,
-        action=action,
+    return FeedbackResponse(
+        recorded=True,
+        interaction_id=response.interaction_id,
+        stored_action=response.stored_action,
+        derived_signal=response.derived_signal,
     )
 
-    profile_service = ProfileUpdateService()
-    profile_service.update_from_interaction(
-        db,
-        user_id=user_id,
-        news_id=body.news_id,
-        action=action,
-    )
-
-    return FeedbackOut(recorded=True, news_id=body.news_id, action=action)

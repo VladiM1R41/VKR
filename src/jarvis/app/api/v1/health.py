@@ -1,86 +1,52 @@
-"""GET /health и GET /ready — проверка состояния сервисов."""
+"""Health and readiness endpoints."""
 
 from __future__ import annotations
 
-import logging
-
-from fastapi import APIRouter, status
+from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from qdrant_client import QdrantClient
+from redis import Redis
+from sqlalchemy import text
 
+from jarvis.app.schemas.common import HealthResponse, ReadyResponse
 from jarvis.core.settings import get_settings
+from jarvis.db.session import SyncSessionLocal
 
-logger = logging.getLogger(__name__)
-router = APIRouter(tags=["Health"])
-settings = get_settings()
-
-
-class HealthResponse(BaseModel):
-    status: str
-    version: str = "1.0.0"
+router = APIRouter(tags=["health"])
 
 
-class ReadyResponse(BaseModel):
-    status: str
-    checks: dict[str, str]
-
-
-@router.get(
-    "/health",
-    response_model=HealthResponse,
-    summary="Живость сервиса",
-    description="Всегда возвращает 200 OK. Используется для liveness probe.",
-)
+@router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
-@router.get(
-    "/ready",
-    summary="Готовность сервиса",
-    description="Проверяет соединение с PostgreSQL, Redis и Qdrant. "
-                "Возвращает 200 если все сервисы доступны, 503 если хотя бы один недоступен.",
-)
-def ready() -> JSONResponse:
+@router.get("/ready", response_model=ReadyResponse)
+def ready() -> JSONResponse | ReadyResponse:
+    settings = get_settings()
     checks: dict[str, str] = {}
 
-    # PostgreSQL
     try:
-        from jarvis.db.session import SyncSessionLocal
-        from sqlalchemy import text
         with SyncSessionLocal() as session:
             session.execute(text("SELECT 1"))
         checks["postgres"] = "ok"
     except Exception as exc:
-        logger.warning("readiness check: postgres failed: %s", exc)
-        checks["postgres"] = "error"
+        checks["postgres"] = f"error: {exc.__class__.__name__}"
 
-    # Redis
     try:
-        import redis as redis_lib
-        r = redis_lib.from_url(settings.redis_url, socket_connect_timeout=2)
-        r.ping()
+        Redis.from_url(settings.redis_url, socket_connect_timeout=1).ping()
         checks["redis"] = "ok"
     except Exception as exc:
-        logger.warning("readiness check: redis failed: %s", exc)
-        checks["redis"] = "error"
+        checks["redis"] = f"error: {exc.__class__.__name__}"
 
-    # Qdrant
     try:
-        from qdrant_client import QdrantClient
-        client = QdrantClient(url=settings.qdrant_url, timeout=3)
-        client.get_collections()
+        QdrantClient(url=settings.qdrant_url, timeout=2).get_collections()
         checks["qdrant"] = "ok"
     except Exception as exc:
-        logger.warning("readiness check: qdrant failed: %s", exc)
-        checks["qdrant"] = "error"
+        checks["qdrant"] = f"error: {exc.__class__.__name__}"
 
-    all_ok = all(v == "ok" for v in checks.values())
-    http_status = status.HTTP_200_OK if all_ok else status.HTTP_503_SERVICE_UNAVAILABLE
-    return JSONResponse(
-        status_code=http_status,
-        content=ReadyResponse(
-            status="ok" if all_ok else "degraded",
-            checks=checks,
-        ).model_dump(),
-    )
+    status = "ok" if all(value == "ok" for value in checks.values()) else "degraded"
+    payload = ReadyResponse(status=status, checks=checks)
+    if checks.get("postgres") != "ok":
+        return JSONResponse(status_code=503, content=payload.model_dump())
+    return payload
+

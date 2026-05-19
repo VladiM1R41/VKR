@@ -1,372 +1,205 @@
-"""POST /chat, WS /ws/chat — диалоговый RAG-интерфейс."""
+"""Chat endpoints over retrieval, personalization and Layer 5 generation."""
 
 from __future__ import annotations
 
-import asyncio
-import json
-import logging
-from datetime import datetime
-from typing import Optional
-
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func
 
-from jarvis.app.dependencies import get_db, get_default_user_id
-from jarvis.db.models import ChatMessage, ChatSession
-
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/chat", tags=["Chat"])
-
-
-# ── Schemas ──────────────────────────────────────────────────────────────────
-
-class ChatIn(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-    mode: str = "standard"  # standard | crag | self_rag | graph_rag
-
-
-class SourceCitation(BaseModel):
-    news_id: int
-    title: str
-    source_name: str
-    url: Optional[str] = None
-    published_at: Optional[datetime] = None
-
-
-class ChatOut(BaseModel):
-    session_id: str
-    message_id: Optional[int] = None
-    answer: str
-    confidence: str
-    sources: list[SourceCitation]
-    generation_log_id: Optional[int] = None
-    rag_mode: str
-
-
-class ChatSessionOut(BaseModel):
-    session_id: str
-    title: Optional[str]
-    message_count: int
-    last_message_at: Optional[datetime]
-    created_at: datetime
-
-
-class ChatSessionsOut(BaseModel):
-    items: list[ChatSessionOut]
-    total: int
-
-
-class ChatMessageOut(BaseModel):
-    id: int
-    role: str
-    content: str
-    created_at: datetime
-    generation_log_id: Optional[int]
-
-
-class ChatMessagesOut(BaseModel):
-    session_id: str
-    messages: list[ChatMessageOut]
-
-
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@router.post(
-    "",
-    response_model=ChatOut,
-    summary="Задать вопрос Джарвису (RAG-чат)",
-    description="Принимает вопрос, выполняет поиск релевантных новостей (L3→L4), "
-                "генерирует ответ через выбранный RAG-режим (L5) и возвращает "
-                "текст с цитированием источников.",
+from jarvis.app.dependencies import get_current_user_id, get_db
+from jarvis.app.schemas.chat import (
+    ChatMessageItem,
+    ChatMessagesResponse,
+    ChatRequest,
+    ChatResponse,
+    ChatSessionItem,
+    ChatSessionsResponse,
+    ChatSource,
 )
-def chat(
-    body: ChatIn,
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_default_user_id),
-) -> ChatOut:
-    from jarvis.generation.services import AnswerGenerationService, ChatService, GenerationConfig
-    from jarvis.generation.services.providers.factory import build_primary_provider
-    from jarvis.personalization.services.ranking_service import PersonalizedRankingService
-    from jarvis.retrieval.models.search_models import SearchRequest
-    from jarvis.retrieval.services.search_service import SearchService
-    from jarvis.generation.services.context_assembler import enrich_with_db_data
+from jarvis.db.models import ChatMessage, ChatSession, News
+from jarvis.generation.services.answer_generation_service import build_answer_generation_service
+from jarvis.generation.services.chat_memory_service import ChatMemoryService
+from jarvis.generation.services.chat_service import ChatService
+from jarvis.generation.services.context_assembler import NewsWithContext
+from jarvis.personalization.models.ranking_models import PersonalizedResult
+from jarvis.personalization.services.pipeline_service import PersonalizationPipelineService
+from jarvis.retrieval.models.search_models import SearchRequest
+from jarvis.retrieval.services.search_service import SearchService
 
-    # L3: поиск
-    search_service = SearchService()
-    ranking_service = PersonalizedRankingService()
-    l3_response = search_service.search(SearchRequest(query=body.message, limit=10))
-    l4_response = ranking_service.rerank(db, user_id=user_id, response=l3_response)
+router = APIRouter()
 
-    # Контекст для LLM
-    news_ids = [r.news_id for r in l4_response.results[:5]]
-    source_ids = {r.source_id for r in l4_response.results[:5]}
-    titles = {r.news_id: r.title for r in l4_response.results[:5]}
-    snippets = {r.news_id: r.snippet for r in l4_response.results[:5]}
-    scores = {r.news_id: r.base_score for r in l4_response.results[:5]}
-    rerank_scores = {r.news_id: r.rerank_score for r in l4_response.results[:5]}
-    personalized_scores = {r.news_id: r.personalized_score for r in l4_response.results[:5]}
-    topics_map = {r.news_id: r.topics for r in l4_response.results[:5]}
-    entities_map = {r.news_id: r.entities for r in l4_response.results[:5]}
-    published_map = {
-        r.news_id: r.published_at.isoformat() if r.published_at else ""
-        for r in l4_response.results[:5]
-    }
-    trust_map = {r.news_id: 0.7 for r in l4_response.results[:5]}
-    grade_map = {r.news_id: 3 for r in l4_response.results[:5]}
 
-    docs = enrich_with_db_data(
-        news_ids=news_ids,
-        source_ids=source_ids,
-        titles=titles,
-        snippets=snippets,
-        scores=scores,
-        rerank_scores={k: v or 0.0 for k, v in rerank_scores.items()},
-        personalized_scores=personalized_scores,
-        topics_map=topics_map,
-        entities_map=entities_map,
-        published_map=published_map,
-        trust_map=trust_map,
-        grade_map=grade_map,
-        info_type_map={r.news_id: "daily" for r in l4_response.results[:5]},
-        urgency_map={r.news_id: "normal" for r in l4_response.results[:5]},
-        cluster_map={r.news_id: None for r in l4_response.results[:5]},
-    )
-
-    # L5: генерация
-    provider = build_primary_provider()
-    chat_service = ChatService()
-    gen_service = AnswerGenerationService(provider=provider, config=GenerationConfig(), chat_service=chat_service)
-
-    session_id_int = int(body.session_id) if body.session_id else None
-    session_obj = chat_service.get_or_create_session(db, user_id=user_id, session_id=session_id_int)
-
-    result = gen_service.generate_chat_answer(
-        db,
-        user_query=body.message,
-        news_items=docs,
-        user_id=user_id,
-        session_id=int(session_obj.id),
-        rag_mode_override=body.mode,
-    )
-
-    msg = chat_service.save_assistant_message(
-        db,
-        session_id=int(session_obj.id),
-        content=result.answer_text,
-        generation_log_id=result.generation_log_id,
-    )
-
-    sources = [
-        SourceCitation(
-            news_id=s.news_id,
-            title=s.title,
-            source_name=s.source_name,
-            url=s.url,
+def _personalized_context(session: Session, results: list[PersonalizedResult]) -> list[NewsWithContext]:
+    news_ids = [item.news_id for item in results]
+    if not news_ids:
+        return []
+    rows = session.scalars(select(News).where(News.id.in_(news_ids))).all()
+    news_by_id = {row.id: row for row in rows}
+    context: list[NewsWithContext] = []
+    for item in results:
+        news = news_by_id.get(item.news_id)
+        if news is None:
+            continue
+        context.append(
+            NewsWithContext(
+                news_id=item.news_id,
+                source_id=item.source_id,
+                source_name=item.source_name,
+                title=item.title,
+                content=news.content,
+                snippet_lead=news.snippet_lead or item.snippet,
+                score=float(item.base_score),
+                rerank_score=item.rerank_score,
+                personalized_score=float(item.personalized_score),
+                topics=list(item.topics),
+                entities=list(item.entities),
+                published_at_str=str(item.published_at or news.published_at or ""),
+                trust_score=float(item.trust_score),
+                content_grade=int(item.content_grade),
+                information_type=item.information_type,
+                urgency=item.urgency,
+                event_cluster_id=item.event_cluster_id,
+            )
         )
-        for s in result.sources
-    ]
-    return ChatOut(
-        session_id=str(session_obj.id),
-        message_id=msg.message_id if msg else None,
-        answer=result.answer_text,
-        confidence=result.confidence,
-        sources=sources,
-        generation_log_id=result.generation_log_id,
-        rag_mode=body.mode,
-    )
+    return context
 
 
-@router.get(
-    "/sessions",
-    response_model=ChatSessionsOut,
-    summary="История чат-сессий",
-)
+def _search_context(session: Session, *, query: str, limit: int, user_id: int):
+    l3_response = SearchService().search(SearchRequest(query=query, limit=limit), user_id=str(user_id))
+    l4_response = PersonalizationPipelineService().personalize(session, user_id=user_id, response=l3_response)
+    return l3_response, l4_response, _personalized_context(session, l4_response.results)
+
+
+@router.get("/sessions", response_model=ChatSessionsResponse)
 def list_sessions(
-    limit: int = 20,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-    user_id: int = Depends(get_default_user_id),
-) -> ChatSessionsOut:
-    total = db.scalar(
-        select(func.count()).select_from(ChatSession).where(ChatSession.user_id == user_id)
-    ) or 0
-    rows = db.scalars(
-        select(ChatSession)
-        .where(ChatSession.user_id == user_id)
-        .order_by(ChatSession.last_message_at.desc())
-        .limit(limit)
-        .offset(offset)
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+    limit: int = 30,
+) -> ChatSessionsResponse:
+    rows = ChatService().list_user_sessions(session, user_id=user_id, limit=limit)
+    counts = dict(
+        session.execute(
+            select(ChatMessage.session_id, func.count(ChatMessage.id))
+            .where(ChatMessage.session_id.in_([row.id for row in rows] or [-1]))
+            .group_by(ChatMessage.session_id)
+        ).all()
+    )
+    return ChatSessionsResponse(
+        items=[
+            ChatSessionItem(
+                id=row.id,
+                title=row.title,
+                created_at=row.created_at,
+                last_message_at=row.last_message_at,
+                message_count=int(counts.get(row.id, 0)),
+            )
+            for row in rows
+        ]
+    )
+
+
+@router.get("/sessions/{session_id}/messages", response_model=ChatMessagesResponse)
+def get_messages(
+    session_id: int,
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> ChatMessagesResponse:
+    chat_session = ChatService().get_session(session, session_id=session_id, user_id=user_id)
+    if chat_session is None:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+    rows = session.scalars(
+        select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.created_at)
     ).all()
-    items = [
-        ChatSessionOut(
-            session_id=str(r.id),
-            title=r.title,
-            message_count=db.scalar(
-                select(func.count()).select_from(ChatMessage).where(ChatMessage.session_id == r.id)
-            ) or 0,
-            last_message_at=r.last_message_at,
-            created_at=r.created_at,
+    return ChatMessagesResponse(
+        session_id=session_id,
+        messages=[
+            ChatMessageItem(
+                id=row.id,
+                role=row.role,
+                content=row.content,
+                generation_log_id=row.generation_log_id,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ],
+    )
+
+
+@router.post("", response_model=ChatResponse)
+def chat(
+    request: ChatRequest,
+    session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+) -> ChatResponse:
+    l3_response, _, context = _search_context(session, query=request.message, limit=request.limit, user_id=user_id)
+    if not context:
+        raise HTTPException(status_code=404, detail="No processed news context found for this question")
+
+    service = build_answer_generation_service(
+        chat_service=ChatService(),
+        chat_memory_service=ChatMemoryService(),
+    )
+    try:
+        result = service.generate_chat_answer(
+            session,
+            user_query=request.message,
+            news_items=context,
+            user_id=user_id,
+            session_id=request.session_id,
+            intent=l3_response.intent,
+            rag_mode_override=request.mode,
         )
-        for r in rows
-    ]
-    return ChatSessionsOut(items=items, total=int(total))
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        raise HTTPException(status_code=502, detail=f"Generation failed: {exc}") from exc
 
-
-@router.get(
-    "/sessions/{session_id}/messages",
-    response_model=ChatMessagesOut,
-    summary="Сообщения чат-сессии",
-)
-def session_messages(
-    session_id: str,
-    db: Session = Depends(get_db),
-) -> ChatMessagesOut:
-    rows = db.scalars(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == int(session_id))
-        .order_by(ChatMessage.created_at.asc())
-    ).all()
-    messages = [
-        ChatMessageOut(
-            id=int(r.id),
-            role=str(r.role),
-            content=str(r.content),
-            created_at=r.created_at,
-            generation_log_id=r.generation_log_id,
+    chat_session_id = request.session_id
+    if chat_session_id is None:
+        latest = session.scalar(
+            select(ChatSession)
+            .where(ChatSession.user_id == user_id)
+            .order_by(desc(ChatSession.last_message_at).nullslast(), desc(ChatSession.id))
+            .limit(1)
         )
-        for r in rows
-    ]
-    return ChatMessagesOut(session_id=session_id, messages=messages)
+        chat_session_id = latest.id if latest else None
 
+    return ChatResponse(
+        session_id=chat_session_id,
+        answer=result.answer_text,
+        confidence=result.confidence or "LOW",
+        rag_mode=result.rag_mode,
+        model_name=result.model_name,
+        generation_log_id=result.generation_log_id,
+        search_time_ms=l3_response.search_time_ms,
+        sources=[
+            ChatSource(news_id=source.news_id, source_name=source.source_name, title=source.title)
+            for source in result.sources
+        ],
+        citation_valid=result.citation_valid,
+        groundedness_score=result.groundedness_score,
+        has_unsupported_claims=result.has_unsupported_claims,
+    )
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
 
 @router.websocket("/ws")
-async def chat_ws(websocket: WebSocket):
-    """WebSocket: стриминговый RAG-чат.
-
-    Client sends: {"message": "...", "session_id": "...", "mode": "standard"}
-    Server streams tokens: {"type": "token", "content": "..."}
-    Server sends done:     {"type": "done", "session_id": "...", "confidence": "HIGH", "sources": [...]}
-    """
+async def chat_ws(websocket: WebSocket) -> None:
+    """Simple WebSocket wrapper: generate a full answer, then stream words."""
     await websocket.accept()
     try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_json({"type": "error", "detail": "Invalid JSON"})
-                continue
+        payload = await websocket.receive_json()
+        request = ChatRequest.model_validate(payload)
+        from jarvis.db.session import SyncSessionLocal
 
-            message = data.get("message", "").strip()
-            if not message:
-                await websocket.send_json({"type": "error", "detail": "Empty message"})
-                continue
-
-            session_id = data.get("session_id")
-            mode = data.get("mode", "standard")
-
-            # Запуск генерации в отдельном потоке (синхронные сервисы)
-            await websocket.send_json({"type": "thinking"})
-            try:
-                result = await asyncio.to_thread(
-                    _ws_generate,
-                    message=message,
-                    session_id=session_id,
-                    mode=mode,
-                    user_id=1,
-                )
-                # Эмулируем стриминг: разбиваем ответ на слова
-                words = result["answer"].split()
-                for word in words:
-                    await websocket.send_json({"type": "token", "content": word + " "})
-                    await asyncio.sleep(0.02)
-                await websocket.send_json({
-                    "type": "done",
-                    "session_id": result["session_id"],
-                    "confidence": result["confidence"],
-                    "sources": result["sources"],
-                    "rag_mode": mode,
-                })
-            except Exception as exc:
-                logger.exception("WS chat generation error: %s", exc)
-                await websocket.send_json({"type": "error", "detail": str(exc)})
-
+        with SyncSessionLocal() as db:
+            response = chat(request, db, get_current_user_id())
+        for token in response.answer.split():
+            await websocket.send_json({"type": "token", "content": token + " "})
+        await websocket.send_json({"type": "done", "payload": response.model_dump(mode="json")})
     except WebSocketDisconnect:
-        pass
+        return
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "detail": str(exc)})
+    finally:
+        await websocket.close()
 
-
-DEFAULT_USER_ID_WS = 1
-
-
-def _ws_generate(*, message: str, session_id: str | None, mode: str, user_id: int) -> dict:
-    """Синхронная обёртка для запуска в asyncio.to_thread."""
-    from jarvis.db.session import SyncSessionLocal
-    from jarvis.generation.services import AnswerGenerationService, ChatService, GenerationConfig
-    from jarvis.generation.services.context_assembler import enrich_with_db_data
-    from jarvis.generation.services.providers.factory import build_primary_provider
-    from jarvis.personalization.services.ranking_service import PersonalizedRankingService
-    from jarvis.retrieval.models.search_models import SearchRequest
-    from jarvis.retrieval.services.search_service import SearchService
-
-    search_service = SearchService()
-    l3_response = search_service.search(SearchRequest(query=message, limit=10))
-
-    with SyncSessionLocal() as db:
-        ranking_service = PersonalizedRankingService()
-        l4_response = ranking_service.rerank(db, user_id=user_id, response=l3_response)
-
-        top = l4_response.results[:5]
-        docs = enrich_with_db_data(
-            news_ids=[r.news_id for r in top],
-            source_ids={r.source_id for r in top},
-            titles={r.news_id: r.title for r in top},
-            snippets={r.news_id: r.snippet for r in top},
-            scores={r.news_id: r.base_score for r in top},
-            rerank_scores={r.news_id: r.rerank_score or 0.0 for r in top},
-            personalized_scores={r.news_id: r.personalized_score for r in top},
-            topics_map={r.news_id: r.topics for r in top},
-            entities_map={r.news_id: r.entities for r in top},
-            published_map={r.news_id: r.published_at.isoformat() if r.published_at else "" for r in top},
-            trust_map={r.news_id: 0.7 for r in top},
-            grade_map={r.news_id: 3 for r in top},
-            info_type_map={r.news_id: "daily" for r in top},
-            urgency_map={r.news_id: "normal" for r in top},
-            cluster_map={r.news_id: None for r in top},
-        )
-
-        provider = build_primary_provider()
-        chat_service = ChatService()
-        gen_service = AnswerGenerationService(provider=provider, config=GenerationConfig(), chat_service=chat_service)
-
-        session_id_int = int(session_id) if session_id else None
-        session_obj = chat_service.get_or_create_session(db, user_id=user_id, session_id=session_id_int)
-
-        result = gen_service.generate_chat_answer(
-            db,
-            user_query=message,
-            news_items=docs,
-            user_id=user_id,
-            session_id=int(session_obj.id),
-            rag_mode_override=mode,
-        )
-        chat_service.save_assistant_message(
-            db,
-            session_id=int(session_obj.id),
-            content=result.answer_text,
-            generation_log_id=result.generation_log_id,
-        )
-
-        return {
-            "session_id": str(session_obj.id),
-            "answer": result.answer_text,
-            "confidence": result.confidence,
-            "sources": [
-                {"news_id": s.news_id, "title": s.title, "source_name": s.source_name}
-                for s in result.sources
-            ],
-        }

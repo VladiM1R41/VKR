@@ -1,1 +1,2 @@
-# Layer 6: FastAPI application
+"""Layer 6 FastAPI application."""
+
