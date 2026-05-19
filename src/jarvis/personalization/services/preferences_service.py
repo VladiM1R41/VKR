@@ -162,6 +162,7 @@ class ExplicitPreferencesService:
         self._replace_entity_subscriptions(session, user.id, payload.entity_subscriptions)
         self._replace_tracked_keywords(session, user.id, payload.tracked_keywords)
         self._replace_source_preferences(session, user.id, payload.source_preferences)
+        self._mark_explicit_collections(user, payload)
 
         session.add(user)
         session.commit()
@@ -263,6 +264,14 @@ class ExplicitPreferencesService:
                     preference=item.preference,
                 )
             )
+
+    @staticmethod
+    def _mark_explicit_collections(user: User, payload: ExplicitPreferencesUpdateRequest) -> None:
+        settings = dict(user.settings or {})
+        settings["explicit_topic_ids"] = sorted({int(item.topic_id) for item in payload.topic_weights})
+        settings["explicit_entity_ids"] = sorted({int(item.entity_id) for item in payload.entity_weights})
+        settings["explicit_source_ids"] = sorted({int(item.source_id) for item in payload.source_preferences})
+        user.settings = settings
 
     @staticmethod
     def _ids_from_rows(rows: Iterable[object], attr_name: str) -> list[int]:

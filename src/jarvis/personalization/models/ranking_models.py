@@ -25,6 +25,16 @@ class PersonalizedResult(BaseModel):
     # Поля из Layer 3, пробрасываемые насквозь (нужны Layer 5 и Layer 6)
     chunk_id: str | None = None
     rerank_score: float | None = None
+    trust_score: float = 0.5
+    content_grade: int = 6
+    information_type: str = "daily"
+    urgency: str = "normal"
+    event_cluster_id: int | None = None
+    value_score: float | None = None
+    freshness: float | None = None
+    completeness: float | None = None
+    cluster_support: float | None = None
+    is_uncertain: bool = False
 
 
 class PersonalizedSearchResponse(BaseModel):

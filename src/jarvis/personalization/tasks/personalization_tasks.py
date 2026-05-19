@@ -62,6 +62,7 @@ def build_alert_batch_task(
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
     service = AlertService()
     total_alerts = 0
+    marked_alerts = 0
 
     with SyncSessionLocal() as session:
         recent_news_ids = list(
@@ -86,7 +87,12 @@ def build_alert_batch_task(
                     news_ids=[int(nid) for nid in recent_news_ids],
                 )
                 total_alerts += len(batch.alerts)
+                marked_alerts += service.mark_alerts_sent(batch)
             except Exception:
                 logger.exception("build_alert_batch_task: ошибка для user_id=%s", user_id)
 
-    return {"users_processed": len(user_ids), "alerts_generated": total_alerts}
+    return {
+        "users_processed": len(user_ids),
+        "alerts_generated": total_alerts,
+        "alerts_marked_sent": marked_alerts,
+    }

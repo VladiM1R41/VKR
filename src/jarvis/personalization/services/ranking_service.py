@@ -7,7 +7,7 @@ import math
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from jarvis.db.models import Chunk, Entity, Topic, User, UserEntitySubscription, UserEntityWeight, UserSourcePreference, UserTopicWeight
+from jarvis.db.models import Chunk, Entity, News, Topic, User, UserEntitySubscription, UserEntityWeight, UserSourcePreference, UserTopicWeight
 from jarvis.personalization.models.ranking_models import PersonalizedResult, PersonalizedSearchResponse
 from jarvis.personalization.services.interaction_service import SessionSeenHistory
 from jarvis.personalization.services.profile_update_service import SessionProfileStore
@@ -37,10 +37,11 @@ class PersonalizedRankingService:
             "entity": 0.20,
             "source": 0.10,
             "session": 0.15,
-            "embedding": 0.12,
+            "embedding": 0.08,
             "seen": 0.30,
             "block": 1.00,
         }
+        self._max_positive_boost = 0.12
 
     def rerank(self, session: Session, user_id: int, response: SearchResponse) -> PersonalizedSearchResponse:
         """Rerank Layer 3 results according to explicit and implicit profile state."""
@@ -55,6 +56,8 @@ class PersonalizedRankingService:
         seen_news_ids = set(self._seen_history.get_seen_news_ids(user_id=user_id))
         session_profile = self._session_profile_store.load(user_id)
         user_embedding = self._user_embedding_service.load_user_embedding(session, user_id)
+        source_affinity_scores = self._load_source_affinity_scores(user)
+        news_quality = self._load_news_quality(session, [result.news_id for result in response.results])
         article_vectors = (
             self._load_article_vectors(session, [result.news_id for result in response.results])
             if user_embedding
@@ -89,6 +92,7 @@ class PersonalizedRankingService:
                 result.source_id,
                 result.source_name,
                 source_preferences,
+                source_affinity_scores,
             )
             reasons.extend(source_reasons)
 
@@ -113,16 +117,26 @@ class PersonalizedRankingService:
             if seen_penalty:
                 reasons.append("seen_penalty_applied")
 
-            personalized_score = (
-                base_score
-                + self._weights["topic"] * topic_affinity
+            content_grade, is_uncertain = news_quality.get(result.news_id, (None, False))
+            positive_boost = (
+                self._weights["topic"] * topic_affinity
                 + self._weights["entity"] * entity_affinity
-                + self._weights["source"] * source_affinity
+                + self._weights["source"] * max(0.0, source_affinity)
                 + self._weights["session"] * session_affinity
                 + self._weights["embedding"] * embedding_affinity
-                - self._weights["seen"] * seen_penalty
-                - self._weights["block"] * (1.0 if is_blocked else 0.0)
             )
+            positive_boost = min(positive_boost, self._quality_boost_cap(content_grade, is_uncertain))
+            if content_grade is not None and content_grade >= 5:
+                reasons.append(f"trust_guard: grade={content_grade}")
+            elif is_uncertain:
+                reasons.append("trust_guard: uncertain")
+
+            negative_penalty = (
+                self._weights["source"] * abs(min(0.0, source_affinity))
+                + self._weights["seen"] * seen_penalty
+                + self._weights["block"] * (1.0 if is_blocked else 0.0)
+            )
+            personalized_score = base_score + positive_boost - negative_penalty
             # Гарантируем [0.0, 1.0]: аддитивная формула может дать > 1 при высоком affinity
             personalized_score = max(0.0, min(1.0, personalized_score))
 
@@ -142,6 +156,16 @@ class PersonalizedRankingService:
                     personalization_reasons=reasons,
                     chunk_id=result.chunk_id,
                     rerank_score=result.rerank_score,
+                    trust_score=result.trust_score,
+                    content_grade=result.content_grade,
+                    information_type=result.information_type,
+                    urgency=result.urgency,
+                    event_cluster_id=result.event_cluster_id,
+                    value_score=result.value_score,
+                    freshness=result.freshness,
+                    completeness=result.completeness,
+                    cluster_support=result.cluster_support,
+                    is_uncertain=result.is_uncertain,
                 )
             )
 
@@ -177,6 +201,29 @@ class PersonalizedRankingService:
             select(UserSourcePreference).where(UserSourcePreference.user_id == user_id)
         ).all()
         return {row.source_id: row.preference for row in rows}
+
+    @staticmethod
+    def _load_source_affinity_scores(user: User) -> dict[int, float]:
+        settings = dict(user.settings or {})
+        raw_scores = settings.get("source_affinity_scores", {})
+        if not isinstance(raw_scores, dict):
+            return {}
+        result: dict[int, float] = {}
+        for source_id, value in raw_scores.items():
+            try:
+                result[int(source_id)] = max(0.0, min(1.0, float(value)))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @staticmethod
+    def _load_news_quality(session: Session, news_ids: list[int]) -> dict[int, tuple[int, bool]]:
+        if not news_ids:
+            return {}
+        rows = session.execute(
+            select(News.id, News.content_grade, News.is_uncertain).where(News.id.in_(sorted(set(news_ids))))
+        ).all()
+        return {int(row[0]): (int(row[1]), bool(row[2])) for row in rows}
 
     @staticmethod
     def _load_topic_name_to_id(session: Session, topic_names: list[str]) -> dict[str, int]:
@@ -242,13 +289,33 @@ class PersonalizedRankingService:
         source_id: int,
         source_name: str,
         source_preferences: dict[int, str],
+        source_affinity_scores: dict[int, float],
     ) -> tuple[float, list[str], bool]:
         preference = source_preferences.get(source_id, "neutral")
         if preference == "preferred":
             return 1.0, [f"preferred_source: {source_name}"], False
         if preference == "blocked":
             return -1.0, [f"blocked_source: {source_name}"], True
+        implicit_score = source_affinity_scores.get(source_id)
+        if implicit_score is None:
+            return 0.0, [], False
+        affinity = max(-0.5, min(0.5, implicit_score - 0.5))
+        if affinity >= 0.2:
+            return affinity, [f"source_affinity: {source_name}"], False
+        if affinity <= -0.2:
+            return affinity, [f"source_penalty: {source_name}"], False
         return 0.0, [], False
+
+    def _quality_boost_cap(self, content_grade: int | None, is_uncertain: bool) -> float:
+        if is_uncertain:
+            return 0.03
+        if content_grade is None:
+            return self._max_positive_boost
+        if content_grade >= 5:
+            return 0.03
+        if content_grade == 4:
+            return 0.06
+        return self._max_positive_boost
 
     @staticmethod
     def _session_affinity(
@@ -292,7 +359,10 @@ class PersonalizedRankingService:
                 continue
             best_point_by_news[int(news_id)] = str(point_id)
 
-        vectors_by_point = self._vector_fetcher.fetch_dense_vectors(list(best_point_by_news.values()))
+        try:
+            vectors_by_point = self._vector_fetcher.fetch_dense_vectors(list(best_point_by_news.values()))
+        except Exception:
+            return {}
         result: dict[int, list[float]] = {}
         for news_id, point_id in best_point_by_news.items():
             vector = vectors_by_point.get(point_id)

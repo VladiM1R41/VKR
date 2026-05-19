@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from jarvis.generation.services.answer_generation_service import AnswerGenerationService
-    from jarvis.generation.services.context_assembler import NewsWithContext
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from jarvis.core.logging import log_event
+from jarvis.generation.services.context_assembler import NewsWithContext
 from jarvis.db.models import (
     Entity,
     EntityProfile,
@@ -72,9 +72,11 @@ class AlertService:
             .where(UserEntitySubscription.user_id == user_id)
         ).all()
         subscribed_entities = {int(row[0]): str(row[1]) for row in subscription_rows}
-        # Флаги для каждой подписки: entity_id → {alert_on_news, alert_on_spike}
+        # Флаги для каждой подписки: entity_id -> {alert_on_news, alert_on_spike}.
+        # Старые тестовые/служебные rows могли содержать только entity_id/name,
+        # поэтому отсутствующие флаги трактуем как включенные уведомления.
         subscription_flags: dict[int, dict[str, bool]] = {
-            int(row[0]): {"alert_on_news": bool(row[2]), "alert_on_spike": bool(row[3])}
+            int(row[0]): self._subscription_alert_flags(row)
             for row in subscription_rows
         }
 
@@ -200,6 +202,15 @@ class AlertService:
         return {int(row[0]): str(row[1]) for row in session.execute(stmt).all()}
 
     @staticmethod
+    def _subscription_alert_flags(row: object) -> dict[str, bool]:
+        """Return alert flags from a subscription row with safe legacy defaults."""
+        row_len = len(row)  # type: ignore[arg-type]
+        return {
+            "alert_on_news": bool(row[2]) if row_len > 2 else True,  # type: ignore[index]
+            "alert_on_spike": bool(row[3]) if row_len > 3 else True,  # type: ignore[index]
+        }
+
+    @staticmethod
     def _load_topic_names(session: Session) -> dict[int, str]:
         return {int(row.id): str(row.name) for row in session.scalars(select(Topic)).all()}
 
@@ -257,13 +268,20 @@ class AlertService:
         """
         news_item = NewsWithContext(
             news_id=news.id,
+            source_id=news.source_id,
             source_name=source_name,
             title=news.title,
             content=news.content or "",
-            snippet=news.snippet_lead or "",
+            snippet_lead=news.snippet_lead or "",
+            score=alert.score,
+            rerank_score=alert.score,
+            personalized_score=alert.score,
             trust_score=float((news.extra or {}).get("trust_score", 0.5)),
             content_grade=int(news.content_grade or 6),
-            published_at=news.published_at,
+            information_type=str(news.information_type or "daily"),
+            urgency=str(news.urgency or "normal"),
+            event_cluster_id=getattr(news, "event_cluster_id", None),
+            published_at_str=str(news.published_at or ""),
         )
 
         result = generation_service.generate_alert(

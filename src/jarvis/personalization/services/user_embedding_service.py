@@ -161,7 +161,11 @@ class UserEmbeddingService:
                 continue
             best_point_by_news[int(news_id)] = str(point_id)
 
-        vectors_by_point = self._vector_fetcher.fetch_dense_vectors(list(best_point_by_news.values()))
+        try:
+            vectors_by_point = self._vector_fetcher.fetch_dense_vectors(list(best_point_by_news.values()))
+        except Exception:
+            logger.exception("Unable to load Qdrant vectors for user embedding rebuild")
+            return {}
         result: dict[int, list[float]] = {}
         for news_id, point_id in best_point_by_news.items():
             vector = vectors_by_point.get(point_id)

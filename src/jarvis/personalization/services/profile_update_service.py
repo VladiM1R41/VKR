@@ -18,7 +18,6 @@ from jarvis.db.models import (
     User,
     UserEntityWeight,
     UserInteraction,
-    UserSourcePreference,
     UserTopicWeight,
 )
 
@@ -137,8 +136,10 @@ class ProfileUpdateService:
             ).all()
         )
 
-        updated_topics = self._update_topic_weights(session, interaction.user_id, topic_ids, signal)
-        updated_entities = self._update_entity_weights(session, interaction.user_id, entity_ids, signal)
+        explicit_topic_ids = self._explicit_ids(user, "explicit_topic_ids")
+        explicit_entity_ids = self._explicit_ids(user, "explicit_entity_ids")
+        updated_topics = self._update_topic_weights(session, interaction.user_id, topic_ids, signal, explicit_topic_ids)
+        updated_entities = self._update_entity_weights(session, interaction.user_id, entity_ids, signal, explicit_entity_ids)
         self._update_source_preference(session, user, news.source_id, signal)
         self._session_store.update(
             interaction.user_id,
@@ -162,9 +163,19 @@ class ProfileUpdateService:
         """Return current short-term session profile."""
         return self._session_store.load(user_id)
 
-    def _update_topic_weights(self, session: Session, user_id: int, topic_ids: list[int], signal: float) -> int:
+    def _update_topic_weights(
+        self,
+        session: Session,
+        user_id: int,
+        topic_ids: list[int],
+        signal: float,
+        explicit_topic_ids: set[int] | None = None,
+    ) -> int:
         updated = 0
+        explicit_topic_ids = explicit_topic_ids or set()
         for topic_id in topic_ids:
+            if int(topic_id) in explicit_topic_ids:
+                continue
             row = session.get(UserTopicWeight, {"user_id": user_id, "topic_id": topic_id})
             if row is None:
                 row = UserTopicWeight(user_id=user_id, topic_id=topic_id, weight=0.5)
@@ -173,9 +184,19 @@ class ProfileUpdateService:
             updated += 1
         return updated
 
-    def _update_entity_weights(self, session: Session, user_id: int, entity_ids: list[int], signal: float) -> int:
+    def _update_entity_weights(
+        self,
+        session: Session,
+        user_id: int,
+        entity_ids: list[int],
+        signal: float,
+        explicit_entity_ids: set[int] | None = None,
+    ) -> int:
         updated = 0
+        explicit_entity_ids = explicit_entity_ids or set()
         for entity_id in entity_ids:
+            if int(entity_id) in explicit_entity_ids:
+                continue
             row = session.get(UserEntityWeight, {"user_id": user_id, "entity_id": entity_id})
             if row is None:
                 row = UserEntityWeight(user_id=user_id, entity_id=entity_id, weight=0.5)
@@ -192,19 +213,6 @@ class ProfileUpdateService:
         source_scores[str(source_id)] = round(next_score, 4)
         settings["source_affinity_scores"] = source_scores
         user.settings = settings
-
-        preference = "neutral"
-        if next_score >= 0.65:
-            preference = "preferred"
-        elif next_score <= 0.35:
-            preference = "blocked"
-
-        row = session.get(UserSourcePreference, {"user_id": user.id, "source_id": source_id})
-        if row is None:
-            row = UserSourcePreference(user_id=user.id, source_id=source_id, preference=preference)
-            session.add(row)
-        else:
-            row.preference = preference
 
     def _apply_signal(self, current_weight: float, signal: float) -> float:
         normalized_target = _clamp01((signal + 1.0) / 2.0)
@@ -234,3 +242,16 @@ class ProfileUpdateService:
                 return 0.7
             return 0.5
         return 0.0
+
+    @staticmethod
+    def _explicit_ids(user: User, key: str) -> set[int]:
+        values = (user.settings or {}).get(key, [])
+        if not isinstance(values, list):
+            return set()
+        result: set[int] = set()
+        for value in values:
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return result

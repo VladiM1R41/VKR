@@ -10,8 +10,9 @@ from jarvis.personalization.models.ranking_models import PersonalizedResult, Per
 class DiversityService:
     """Apply anti-filter-bubble rules over personalized results."""
 
-    def __init__(self, *, top_k_window: int = 10) -> None:
+    def __init__(self, *, top_k_window: int = 10, max_insertion_score_drop: float = 0.015) -> None:
         self._top_k_window = top_k_window
+        self._max_insertion_score_drop = max_insertion_score_drop
 
     def apply(
         self,
@@ -100,6 +101,11 @@ class DiversityService:
             return results
 
         candidate = results.pop(insertion_idx)
+        top_score = results[0].personalized_score if results else candidate.personalized_score
+        if top_score - candidate.personalized_score > self._max_insertion_score_drop:
+            results.insert(insertion_idx, candidate)
+            return results
+
         candidate.personalization_reasons = [
             *candidate.personalization_reasons,
             "diversity_insertion",

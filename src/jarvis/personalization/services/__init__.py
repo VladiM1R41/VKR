@@ -9,6 +9,7 @@ from jarvis.personalization.services.interaction_service import (
     SessionSeenHistory,
 )
 from jarvis.personalization.services.preferences_service import ExplicitPreferencesService
+from jarvis.personalization.services.pipeline_service import PersonalizationPipelineService
 from jarvis.personalization.services.profile_update_service import (
     ProfileUpdateResult,
     ProfileUpdateService,
@@ -30,6 +31,7 @@ __all__ = [
     "PersonalizationEvaluationService",
     "InteractionLoggingService",
     "SessionSeenHistory",
+    "PersonalizationPipelineService",
     "ProfileUpdateService",
     "ProfileUpdateResult",
     "QdrantVectorFetcher",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import UTC, datetime
 from hashlib import sha256
 import logging
 from typing import TYPE_CHECKING
@@ -148,6 +149,7 @@ class DigestOrchestrationService:
             topics_covered=list(shortlist.topics_covered),
             content_hash=shortlist.content_hash,
             generation_log_id=generation_log_id,
+            generated_at=datetime.now(UTC),
         )
         session.add(digest)
         session.flush()
