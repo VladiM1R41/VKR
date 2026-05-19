@@ -30,8 +30,7 @@ def canonicalize_url(url: str, keep_params: list[str] | None = None) -> str:
 
     scheme = (parts.scheme or "https").lower()
     hostname = (parts.hostname or "").lower()
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
+    hostname = hostname.removeprefix("www.")
 
     port = parts.port
     if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
@@ -64,4 +63,3 @@ def normalized_title_hash(title: str) -> str:
     normalized = html.unescape(title or "")
     normalized = re.sub(r"\s+", " ", normalized).strip().lower()
     return hashlib.md5(normalized.encode("utf-8")).hexdigest()
-

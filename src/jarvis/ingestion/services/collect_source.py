@@ -19,6 +19,7 @@ from jarvis.db.session import SyncSessionLocal
 from jarvis.core.logging import log_event
 from jarvis.core.settings import get_settings
 from jarvis.ingestion.collectors.dispatcher import CollectorDispatcher
+from jarvis.ingestion.services.pubsub import publish_breaking_event, publish_new_articles_ready
 from jarvis.ingestion.services.distributed_lock import (
     acquire_collection_lock,
     clear_collection_pending,
@@ -27,6 +28,7 @@ from jarvis.ingestion.services.distributed_lock import (
     request_enrichment_rerun,
 )
 from jarvis.ingestion.services.health import refresh_source_health
+from jarvis.ingestion.services.run_timing import calculate_duration_seconds, utc_now
 
 
 LOW_THRESHOLD = 1000
@@ -93,7 +95,12 @@ def _check_backpressure(source: Source) -> dict[str, int | str] | None:
 
 def _start_run(source_id: int, *, run_kind: str = DISCOVERY_RUN_KIND) -> int:
     with SyncSessionLocal() as session:
-        run = IngestionRun(source_id=source_id, run_kind=run_kind, status="running")
+        run = IngestionRun(
+            source_id=source_id,
+            run_kind=run_kind,
+            status="running",
+            started_at=utc_now(),
+        )
         session.add(run)
         session.commit()
         session.refresh(run)
@@ -127,7 +134,7 @@ def _finalize_run(
         if run is None or source is None:
             return
 
-        finished_at = datetime.now(timezone.utc)
+        finished_at = utc_now()
         run.status = status
         run.items_total = items_total
         run.items_new = items_new
@@ -142,7 +149,7 @@ def _finalize_run(
         run.received_etag = received_etag
         run.received_last_modified = received_last_modified
         run.finished_at = finished_at
-        duration_seconds = (finished_at - run.started_at).total_seconds()
+        duration_seconds = calculate_duration_seconds(run.started_at, finished_at)
         run.duration_seconds = duration_seconds
 
         source.last_run_id = run.id
@@ -167,7 +174,7 @@ def _finalize_run(
     log_level = logging.INFO
     if status in {"failed", "timeout"}:
         log_level = logging.ERROR
-    elif status == "partial":
+    elif status in {"partial", "skipped_backpressure"}:
         log_level = logging.WARNING
     log_event(
         logger,
@@ -385,6 +392,86 @@ def _persist_articles(run_id: int, source_id: int, articles: list) -> tuple[list
     return inserted_ids, duplicates, failures
 
 
+def _load_inserted_news_metadata(news_ids: list[int]) -> list[dict[str, int | str | None]]:
+    if not news_ids:
+        return []
+
+    with SyncSessionLocal() as session:
+        rows = session.execute(
+            select(News.id, News.event_cluster_id, News.urgency).where(News.id.in_(news_ids))
+        ).all()
+
+    metadata_by_id = {
+        int(news_id): {
+            "news_id": int(news_id),
+            "event_cluster_id": int(event_cluster_id) if event_cluster_id is not None else None,
+            "urgency": str(urgency),
+        }
+        for news_id, event_cluster_id, urgency in rows
+    }
+    return [metadata_by_id[news_id] for news_id in news_ids if news_id in metadata_by_id]
+
+
+async def _publish_inserted_article_signals(
+    *,
+    source_id: int,
+    run_id: int,
+    inserted_ids: list[int],
+) -> None:
+    if not inserted_ids:
+        return
+
+    try:
+        await publish_new_articles_ready(source_id, inserted_ids)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "new_articles_ready_publish_failed",
+            source_id=source_id,
+            run_id=run_id,
+            items_new=len(inserted_ids),
+            error_message=str(exc),
+        )
+
+    try:
+        inserted_news = _load_inserted_news_metadata(inserted_ids)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "breaking_events_metadata_load_failed",
+            source_id=source_id,
+            run_id=run_id,
+            items_new=len(inserted_ids),
+            error_message=str(exc),
+        )
+        return
+
+    for item in inserted_news:
+        urgency = str(item["urgency"])
+        if urgency not in {"critical", "high"}:
+            continue
+        event_cluster_id = item["event_cluster_id"]
+
+        try:
+            await publish_breaking_event(
+                news_id=int(item["news_id"]),
+                event_cluster_id=int(event_cluster_id) if event_cluster_id is not None else None,
+                urgency=urgency,
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "breaking_event_publish_failed",
+                source_id=source_id,
+                run_id=run_id,
+                news_id=int(item["news_id"]),
+                error_message=str(exc),
+            )
+
+
 def _classify_source_exception(exc: Exception) -> tuple[str, int | None]:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -428,20 +515,44 @@ async def collect_source_once(source_name: str) -> dict:
                 }
 
             backpressure = _check_backpressure(source)
+            if backpressure and backpressure.get("decision") == "warn":
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "source_run_backpressure_warn",
+                    source_id=source.id,
+                    source_name=source.name,
+                    unprocessed_count=int(backpressure["unprocessed_count"]),
+                )
             if backpressure and backpressure.get("decision") == "skip":
+                reason = str(backpressure.get("reason") or "backpressure_skip")
+                run_id = _start_run(source.id)
+                _finalize_run(
+                    run_id=run_id,
+                    source_id=source.id,
+                    status="skipped_backpressure",
+                    items_total=0,
+                    items_new=0,
+                    items_duplicate=0,
+                    items_failed=0,
+                    http_status=None,
+                    response_bytes=None,
+                )
                 log_event(
                     logger,
                     logging.WARNING,
                     "source_run_skipped_backpressure",
                     source_id=source.id,
                     source_name=source.name,
-                    reason=str(backpressure.get("reason") or "skipped"),
+                    run_id=run_id,
+                    reason=reason,
                     unprocessed_count=int(backpressure["unprocessed_count"]),
                 )
                 return {
                     "source": source.name,
-                    "status": str(backpressure.get("reason") or "skipped"),
-                    "run_id": None,
+                    "status": "skipped_backpressure",
+                    "reason": reason,
+                    "run_id": run_id,
                     "unprocessed_count": int(backpressure["unprocessed_count"]),
                 }
 
@@ -517,12 +628,22 @@ async def collect_source_once(source_name: str) -> dict:
                 item_errors = list(getattr(collector, "last_item_errors", []) or [])
                 _log_item_errors(run_id, source.id, item_errors)
 
-                inserted_ids, duplicates, db_failures = _persist_articles(run_id, source.id, articles)
+                # `items_duplicate` here is a run-level feed metric, not a pure DB-conflict counter:
+                # it includes items skipped by stop_early_on_known plus insert-path duplicates.
+                known_duplicates = int(getattr(collector, "last_known_duplicates_skipped", 0) or 0)
+                inserted_ids, db_duplicates, db_failures = _persist_articles(run_id, source.id, articles)
+                duplicates = known_duplicates + db_duplicates
                 inserted = len(inserted_ids)
                 parse_errors = int(getattr(collector, "last_parse_errors", 0))
                 item_failures = int(getattr(collector, "last_item_failures", 0))
                 total_failures = item_failures + db_failures
                 enqueue_failed = False
+
+                await _publish_inserted_article_signals(
+                    source_id=source.id,
+                    run_id=run_id,
+                    inserted_ids=inserted_ids,
+                )
 
                 if inserted > 0 and _source_uses_html_enrichment(source):
                     try:
@@ -532,8 +653,8 @@ async def collect_source_once(source_name: str) -> dict:
                         _log_run_error(
                             run_id,
                             source.id,
-                            "unknown",
-                            f"Failed to enqueue deferred enrichment: {exc}",
+                            "enqueue_failed",
+                            f"enqueue_failed: deferred enrichment task was not queued: {exc}",
                             mark_run_failed=False,
                             increment_source_error=True,
                         )

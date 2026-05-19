@@ -47,6 +47,22 @@ HEALTH_DASHBOARD_QUERY = text(
         s.consecutive_failures,
         ROUND(s.parse_success_rate::numeric, 3) AS parse_success,
         ROUND(s.extraction_success_rate::numeric, 3) AS extraction_success,
+        (SELECT ROUND(
+            (
+                COUNT(*) FILTER (WHERE ir.status IN ('success','partial','skipped_304'))::numeric
+                / NULLIF(COUNT(*) FILTER (WHERE ir.status != 'skipped_backpressure'), 0)
+            ),
+            3
+         )
+         FROM ingestion_runs ir
+         WHERE ir.source_id = s.id
+           AND ir.run_kind = 'discovery'
+           AND ir.started_at > NOW() - INTERVAL '24 hours') AS parse_success_24h,
+        (SELECT COUNT(*) FROM ingestion_runs ir
+         WHERE ir.source_id = s.id
+           AND ir.run_kind = 'discovery'
+           AND ir.status = 'skipped_backpressure'
+           AND ir.started_at > NOW() - INTERVAL '24 hours') AS backpressure_skips_24h,
         ROUND(s.avg_latency_minutes::numeric, 1) AS avg_latency_minutes,
         ROUND(s.source_utility::numeric, 3) AS source_utility,
         s.latest_published_at,
@@ -55,6 +71,11 @@ HEALTH_DASHBOARD_QUERY = text(
          WHERE ir.source_id = s.id
            AND ir.run_kind = 'discovery'
            AND ir.started_at > NOW() - INTERVAL '24 hours') AS runs_24h,
+        (SELECT COUNT(*) FROM ingestion_runs ir
+         WHERE ir.source_id = s.id
+           AND ir.run_kind = 'discovery'
+           AND ir.status != 'skipped_backpressure'
+           AND ir.started_at > NOW() - INTERVAL '24 hours') AS attempted_runs_24h,
         (SELECT COALESCE(SUM(items_new), 0) FROM ingestion_runs ir
          WHERE ir.source_id = s.id
            AND ir.run_kind = 'discovery'
@@ -159,12 +180,9 @@ def build_health_dashboard() -> list[dict]:
     return rows
 
 
-def run_daily_health_check(*, dry_run: bool = False) -> dict:
-    now_utc = datetime.now(timezone.utc)
-    since_dt = now_utc - timedelta(hours=24)
-
+def _list_active_source_ids() -> list[int]:
     with SyncSessionLocal() as session:
-        source_ids = list(
+        return list(
             session.scalars(
                 select(Source.id)
                 .where(Source.is_active.is_(True))
@@ -172,8 +190,21 @@ def run_daily_health_check(*, dry_run: bool = False) -> dict:
             ).all()
         )
 
+
+def _refresh_sources_for_report(*, dry_run: bool) -> list[dict]:
+    source_ids = _list_active_source_ids()
+    snapshots: list[dict] = []
     for source_id in source_ids:
-        refresh_source_health(source_id)
+        snapshot = refresh_source_health(source_id, persist=not dry_run)
+        if dry_run and snapshot is not None:
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def run_daily_health_check(*, dry_run: bool = False) -> dict:
+    now_utc = datetime.now(timezone.utc)
+    since_dt = now_utc - timedelta(hours=24)
+    dry_run_snapshots = _refresh_sources_for_report(dry_run=dry_run)
 
     with SyncSessionLocal() as session:
         source_utility_updated = 0
@@ -182,7 +213,7 @@ def run_daily_health_check(*, dry_run: bool = False) -> dict:
             session.commit()
 
         audit_result = run_date_audit()
-        dashboard_rows = build_health_dashboard()
+        dashboard_rows = build_health_dashboard() if not dry_run else dry_run_snapshots
 
         orphan_news_raw = int(
             session.execute(

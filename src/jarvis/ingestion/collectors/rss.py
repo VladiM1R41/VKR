@@ -12,9 +12,11 @@ from bs4 import BeautifulSoup, Tag
 from jarvis.db.models import Source
 from jarvis.ingestion.collectors.base import BaseCollector
 from jarvis.ingestion.contracts.normalized_article import NormalizedArticle
+from jarvis.ingestion.extraction import ensure_lxml_available
 from jarvis.ingestion.extraction.postprocess import apply_postprocess_rules
 from jarvis.ingestion.extraction.rss_fulltext import extract_rss_fulltext
 from jarvis.ingestion.mappings.source_taxonomy import map_content_type, map_information_type
+from jarvis.ingestion.network.http_client import decode_response_text, fetch_with_retry
 from jarvis.ingestion.parsing.dates import parse_feed_datetime
 from jarvis.ingestion.parsing.routing import detect_breaking
 from jarvis.ingestion.parsing.urls import canonicalize_url, normalized_title_hash
@@ -55,8 +57,10 @@ class RSSCollector(BaseCollector):
         self.last_received_etag = None
         self.last_received_last_modified = None
         self.last_received_last_build_date = None
+        self.last_known_duplicates_skipped = 0
 
-        response = await self.http.get(
+        response = await fetch_with_retry(
+            self.http,
             feed_url,
             headers=request_headers,
         )
@@ -74,7 +78,9 @@ class RSSCollector(BaseCollector):
         response.raise_for_status()
         self.last_response_bytes = len(response.content)
 
-        soup = BeautifulSoup(response.content, "xml")
+        ensure_lxml_available()
+        feed_text = decode_response_text(response)
+        soup = BeautifulSoup(feed_text, "xml")
         channel = soup.find("channel")
         items = soup.find_all("item", recursive=False)
         if not items and channel:
@@ -89,6 +95,8 @@ class RSSCollector(BaseCollector):
         self.last_items_total = len(items)
         articles: list[NormalizedArticle] = []
         processing_items = self._sort_items_for_processing(items) if self.config.get("stop_early_on_known") else items
+        if self.config.get("stop_early_on_known"):
+            self.last_known_duplicates_skipped = self._count_known_duplicate_candidates(processing_items)
 
         for item in processing_items:
             if self.config.get("stop_early_on_known"):
@@ -314,9 +322,12 @@ class RSSCollector(BaseCollector):
                 if related_titles:
                     extra["source_related_titles"] = related_titles
 
+        urgency = "normal"
         if detect_breaking(raw_title):
             information_type = "breaking"
+            urgency = "high"
             extra["information_type_override"] = "pre_classifier_breaking"
+            extra["urgency"] = urgency
 
         cleaned_content, cleaned_snippet = apply_postprocess_rules(
             content=rss_fulltext.get("content"),
@@ -340,6 +351,7 @@ class RSSCollector(BaseCollector):
             information_type=information_type,
             content_type=content_type,
             language="ru",
+            urgency=urgency,
             raw_content=rss_fulltext.get("raw_content"),
             raw_format=rss_fulltext.get("raw_format") or "html",
             date_inferred=date_inferred,
@@ -496,6 +508,14 @@ class RSSCollector(BaseCollector):
             return items
 
         return [item for _, item in sorted(enumerate(items), key=_sort_key, reverse=True)]
+
+    def _count_known_duplicate_candidates(self, items: list[Tag]) -> int:
+        duplicates = 0
+        for item in items:
+            candidate_url = self._peek_canonical_url(item)
+            if candidate_url and candidate_url in self.known_canonical_urls:
+                duplicates += 1
+        return duplicates
 
     def _record_item_error(
         self,

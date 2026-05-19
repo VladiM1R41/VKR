@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 from uuid import uuid4
 
 from redis.asyncio import Redis
 
 from jarvis.core.settings import get_settings
 
+logger = logging.getLogger(__name__)
 
 _LOCK_RELEASE_SCRIPT = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -36,8 +38,13 @@ async def _acquire_lock(key: str, ttl_seconds: int):
         if acquired:
             try:
                 await redis.eval(_LOCK_RELEASE_SCRIPT, 1, key, token)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "lock_release_failed key=%s error=%s",
+                    key,
+                    exc,
+                    extra={"lock_key": key, "error_message": str(exc)},
+                )
         await redis.aclose()
 
 

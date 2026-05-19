@@ -29,8 +29,9 @@ def parse_feed_datetime(raw_value: str | None) -> tuple[datetime | None, bool]:
     if dt is None:
         return None, True
 
+    date_inferred = False
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+        date_inferred = True
 
-    return dt.astimezone(timezone.utc), False
-
+    return dt.astimezone(timezone.utc), date_inferred

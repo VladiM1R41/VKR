@@ -236,7 +236,11 @@ SOURCE_SEED_DATA: list[dict] = [
                 {
                     "type": "remove_lines_starting_with",
                     "prefixes": ["\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u0435\u0435", "\u0424\u043e\u0442\u043e:"],
-                }
+                },
+                {
+                    "type": "regex_strip_tail",
+                    "pattern": "\\s*\\u041d\\u043e\\u0432\\u043e\\u0441\\u0442\\u0438 \\u043a\\u043e\\u043c\\u043f\\u0430\\u043d\\u0438\\u0439\\s*$",
+                },
             ],
         ),
     },
@@ -267,7 +271,11 @@ SOURCE_SEED_DATA: list[dict] = [
                 {
                     "type": "remove_lines_starting_with",
                     "prefixes": ["\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u0435\u0435", "\u0424\u043e\u0442\u043e:"],
-                }
+                },
+                {
+                    "type": "regex_strip_tail",
+                    "pattern": "\\s*\\u041d\\u043e\\u0432\\u043e\\u0441\\u0442\\u0438 \\u043a\\u043e\\u043c\\u043f\\u0430\\u043d\\u0438\\u0439\\s*$",
+                },
             ],
             extra={"split_title_on": " // "},
         ),
@@ -298,7 +306,11 @@ SOURCE_SEED_DATA: list[dict] = [
                 {
                     "type": "remove_lines_starting_with",
                     "prefixes": ["\u041f\u043e\u0434\u0440\u043e\u0431\u043d\u0435\u0435", "\u0424\u043e\u0442\u043e:"],
-                }
+                },
+                {
+                    "type": "regex_strip_tail",
+                    "pattern": "\\s*\\u041d\\u043e\\u0432\\u043e\\u0441\\u0442\\u0438 \\u043a\\u043e\\u043c\\u043f\\u0430\\u043d\\u0438\\u0439\\s*$",
+                },
             ],
             extra={"split_title_on": " // "},
         ),
@@ -350,6 +362,13 @@ SOURCE_SEED_DATA: list[dict] = [
             has_category=True,
             has_enclosure=True,
             mixed_regional_hosts=True,
+            postprocess_rules=[
+                {
+                    "type": "regex_strip_tail",
+                    "pattern": r"\s*Ваша надежная лента новостей\s*—\s*МК в MAX\.?\s*$",
+                    "flags": "s",
+                },
+            ],
         ),
     },
     {
@@ -422,7 +441,7 @@ SOURCE_SEED_DATA: list[dict] = [
         "config": _rss_config(
             source_key="bfm",
             feed_url="https://www.bfm.ru/news.rss?type=news",
-            full_text_method="html_trafilatura",
+            full_text_method="html_source_specific",
             has_author=True,
             author_format="fio",
             postprocess_rules=[

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import logging
 
 import httpx
@@ -18,6 +17,7 @@ from jarvis.core.settings import get_settings
 from jarvis.ingestion.extraction.postprocess import apply_postprocess_rules, apply_pre_extraction_rules
 from jarvis.ingestion.extraction.source_specific import extract_source_specific
 from jarvis.ingestion.extraction.trafilatura_extractor import extract_with_precision, extract_with_recall
+from jarvis.ingestion.network.http_client import decode_response_text, fetch_with_retry
 from jarvis.ingestion.services.distributed_lock import (
     acquire_enrichment_lock,
     clear_enrichment_pending,
@@ -25,6 +25,7 @@ from jarvis.ingestion.services.distributed_lock import (
     mark_enrichment_pending,
 )
 from jarvis.ingestion.services.health import refresh_source_health
+from jarvis.ingestion.services.run_timing import calculate_duration_seconds, utc_now
 
 
 DEFAULT_USER_AGENT = "JarvisLayer1/0.1 (+research project; contact: local-dev)"
@@ -54,6 +55,13 @@ def _load_pending_articles(source_id: int, limit: int) -> list[News]:
 def _source_uses_html_enrichment(source: Source) -> bool:
     method = str((source.config or {}).get("full_text_method") or "")
     return method.startswith("html_")
+
+
+def _source_specific_min_length(source: Source) -> int:
+    source_key = str((source.config or {}).get("source_key") or "").strip().lower()
+    if source_key == "ria":
+        return 100
+    return 200
 
 
 def _normalize_title_like_text(value: str | None) -> str:
@@ -120,7 +128,12 @@ async def _schedule_followup_enrichment(source: Source, limit: int) -> bool:
 
 def _start_run(source_id: int, *, run_kind: str = ENRICHMENT_RUN_KIND) -> int:
     with SyncSessionLocal() as session:
-        run = IngestionRun(source_id=source_id, run_kind=run_kind, status="running")
+        run = IngestionRun(
+            source_id=source_id,
+            run_kind=run_kind,
+            status="running",
+            started_at=utc_now(),
+        )
         session.add(run)
         session.commit()
         session.refresh(run)
@@ -145,7 +158,7 @@ def _finalize_run(
         if run is None or source is None:
             return
 
-        finished_at = datetime.now(timezone.utc)
+        finished_at = utc_now()
         run.status = status
         run.items_total = items_total
         run.items_new = items_new
@@ -153,7 +166,7 @@ def _finalize_run(
         run.items_failed = items_failed
         run.extraction_errors_count = extraction_errors_count
         run.finished_at = finished_at
-        duration_seconds = (finished_at - run.started_at).total_seconds()
+        duration_seconds = calculate_duration_seconds(run.started_at, finished_at)
         run.duration_seconds = duration_seconds
 
         source.last_run_id = run.id
@@ -190,6 +203,7 @@ def _log_extraction_error(
     http_status: int | None = None,
 ) -> None:
     error_type = "extraction" if http_status is None else _map_http_error_type(http_status)
+
     with SyncSessionLocal() as session:
         session.add(
             IngestionError(
@@ -220,6 +234,40 @@ def _log_extraction_error(
     )
 
 
+def _log_enrichment_enqueue_error(
+    *,
+    run_id: int,
+    source_id: int,
+    source_name: str,
+    error_message: str,
+) -> None:
+    stored_message = f"enqueue_failed: follow-up enrichment task was not queued: {error_message}"
+    with SyncSessionLocal() as session:
+        session.add(
+            IngestionError(
+                run_id=run_id,
+                source_id=source_id,
+                error_type="enqueue_failed",
+                error_message=stored_message,
+            )
+        )
+        source = session.get(Source, source_id)
+        if source is not None:
+            source.last_error = stored_message
+            source.error_count = (source.error_count or 0) + 1
+        session.commit()
+
+    log_event(
+        logger,
+        logging.WARNING,
+        "followup_enrichment_enqueue_failed",
+        source_id=source_id,
+        source_name=source_name,
+        run_id=run_id,
+        error_message=error_message,
+    )
+
+
 def _map_http_error_type(status_code: int) -> str:
     if status_code == 429:
         return "http_429"
@@ -228,6 +276,13 @@ def _map_http_error_type(status_code: int) -> str:
     if 500 <= status_code < 600:
         return "http_5xx"
     return "extraction"
+
+
+def _content_status_for_http_error(status_code: int) -> str:
+    """Map permanent access errors to a terminal status outside enrichment retry backlog."""
+    if status_code in {401, 403, 451}:
+        return "paywall"
+    return "extraction_failed"
 
 
 def _persist_enrichment(
@@ -289,7 +344,11 @@ async def _enrich_single_article(
     parser_version = "htmlenricher-v1"
 
     try:
-        response = await http_client.get(article.url, headers={"User-Agent": DEFAULT_USER_AGENT})
+        response = await fetch_with_retry(
+            http_client,
+            article.url,
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+        )
     except (httpx.TimeoutException, httpx.RequestError) as exc:
         _persist_enrichment(
             news_id=article.id,
@@ -307,15 +366,20 @@ async def _enrich_single_article(
         )
         return False, True
 
+    response_text = decode_response_text(response)
+
     if response.status_code != 200:
         _persist_enrichment(
             news_id=article.id,
             content=None,
-            content_status="extraction_failed",
+            content_status=_content_status_for_http_error(response.status_code),
             extraction_method="http_error",
             parser_version=parser_version,
-            raw_content=response.text if response.text else None,
-            extra_updates={"final_url_after_redirect": str(response.url)},
+            raw_content=response_text or None,
+            extra_updates={
+                "final_url_after_redirect": str(response.url),
+                "last_http_status": response.status_code,
+            },
         )
         _log_extraction_error(
             run_id=run_id,
@@ -326,7 +390,7 @@ async def _enrich_single_article(
         )
         return False, True
 
-    raw_html = response.text
+    raw_html = response_text
     prepared_html = apply_pre_extraction_rules(raw_html, postprocess_rules)
 
     content: str | None = None
@@ -341,7 +405,7 @@ async def _enrich_single_article(
     else:
         source_specific_content = None
 
-    if source_specific_content and len(source_specific_content) >= 200:
+    if source_specific_content and len(source_specific_content) >= _source_specific_min_length(source):
         content = source_specific_content
         content_status = "ok"
         extraction_method = "html_source_specific"
@@ -356,7 +420,7 @@ async def _enrich_single_article(
             recall_text = extract_with_recall(prepared_html)
             if recall_text:
                 content = recall_text
-                content_status = "ok"
+                content_status = "partial"
                 extraction_method = "trafilatura_recall"
 
     content, snippet_lead = apply_postprocess_rules(
@@ -404,6 +468,7 @@ async def enrich_source_pending_once(source_name: str, limit: int = 10) -> dict:
 
     lock_held = False
     followup_needed = False
+    run_id: int | None = None
     try:
         async with acquire_enrichment_lock(source.id) as lock_acquired:
             if not lock_acquired:
@@ -471,7 +536,12 @@ async def enrich_source_pending_once(source_name: str, limit: int = 10) -> dict:
                 items_failed=failures,
                 extraction_errors_count=failures,
             )
-            followup_needed = await consume_enrichment_rerun(source.id) or _has_pending_articles(source.id)
+            has_progress = successes > 0
+            has_more_pending = _has_pending_articles(source.id)
+            pending_rerun_requested = await consume_enrichment_rerun(source.id)
+            followup_needed = (has_progress or failures == 0) and (
+                pending_rerun_requested or has_more_pending
+            )
 
             return {
                 "source": source.name,
@@ -486,7 +556,17 @@ async def enrich_source_pending_once(source_name: str, limit: int = 10) -> dict:
         if lock_held:
             await clear_enrichment_pending(source.id)
             if followup_needed:
-                scheduled = await _schedule_followup_enrichment(source, limit)
+                try:
+                    scheduled = await _schedule_followup_enrichment(source, limit)
+                except Exception as exc:
+                    if run_id is not None:
+                        _log_enrichment_enqueue_error(
+                            run_id=run_id,
+                            source_id=source.id,
+                            source_name=source.name,
+                            error_message=str(exc),
+                        )
+                    scheduled = False
                 log_event(
                     logger,
                     logging.INFO if scheduled else logging.WARNING,

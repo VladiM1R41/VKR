@@ -13,7 +13,11 @@ from jarvis.core.logging import log_event
 from jarvis.core.settings import get_settings
 from jarvis.db.models import Source
 from jarvis.db.session import SyncSessionLocal
-from jarvis.ingestion.services.distributed_lock import is_collection_locked, mark_collection_pending
+from jarvis.ingestion.services.distributed_lock import (
+    clear_collection_pending,
+    is_collection_locked,
+    mark_collection_pending,
+)
 
 
 PRIORITY_ORDER = {
@@ -134,7 +138,30 @@ async def dispatch_due_sources_once(source_name: str | None = None, dry_run: boo
             )
             continue
 
-        _enqueue_collect_source(source.name)
+        try:
+            _enqueue_collect_source(source.name)
+        except Exception as exc:
+            await clear_collection_pending(source.id)
+            due_entries.append(
+                {
+                    "source": source.name,
+                    "source_id": source.id,
+                    "priority": source.priority,
+                    "next_due_at": next_due_at.isoformat(),
+                    "scheduled": False,
+                    "reason": "enqueue_failed",
+                }
+            )
+            log_event(
+                logger,
+                logging.ERROR,
+                "collect_source_enqueue_failed",
+                source_id=source.id,
+                source_name=source.name,
+                error_message=str(exc),
+            )
+            continue
+
         due_entries.append(
             {
                 "source": source.name,

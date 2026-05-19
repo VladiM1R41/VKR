@@ -171,6 +171,21 @@ def _extract_aif_turbo_structured(
         config=config,
         thumbnail_url=thumbnail_url,
     )
+    if config.get("source_key") == "aif_articles":
+        yandex_text = _extract_from_direct_html_tag(
+            item=item,
+            tag_name=config.get("fallback_full_text_tag", "yandex:full-text"),
+            method="rss_yandex_fulltext",
+            description_html=description_html,
+            config=config,
+        )
+        if yandex_text["content"]:
+            yandex_text["extra"] = {
+                **(primary.get("extra") or {}),
+                **(yandex_text.get("extra") or {}),
+            }
+            return yandex_text
+
     if primary["content"]:
         return primary
 

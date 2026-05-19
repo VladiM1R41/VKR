@@ -68,6 +68,10 @@ celery_app.conf.update(
             "task": "jarvis.processing.update_collocations",
             "schedule": crontab(hour=4, minute=0),  # ежедневно в 04:00
         },
+        "update-entity-profiles": {
+            "task": "jarvis.processing.update_entity_profiles",
+            "schedule": crontab(minute=20),  # hourly entity trend refresh
+        },
         "rebuild-user-embeddings": {
             "task": "jarvis.personalization.rebuild_user_embeddings",
             "schedule": crontab(hour="*/4", minute=30),

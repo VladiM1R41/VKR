@@ -23,6 +23,7 @@ class BaseCollector(ABC):
         self.config = source.config or {}
         self.http = http_client
         self.known_canonical_urls = known_canonical_urls or set()
+        self.last_known_duplicates_skipped = 0
 
     @abstractmethod
     async def collect(self) -> list[NormalizedArticle]:
