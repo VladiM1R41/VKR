@@ -75,6 +75,47 @@ def map_source_categories(categories: list[str] | None) -> list[TopicMatch]:
     return matches
 
 
+def classify_topics_lexical(*, title: str, body: str = "", max_topics: int = 3) -> list[TopicMatch]:
+    """Resolve topics from title/body markers without loading the zero-shot model."""
+
+    text = normalize_category_label(f"{title} {body[:1200]}")
+    if not text:
+        return []
+    tokens = set(text.split())
+
+    scored: list[TopicMatch] = []
+    for topic_name, markers in _TOPIC_RULES.items():
+        hits = 0
+        for marker in markers:
+            normalized_marker = normalize_category_label(marker)
+            if not normalized_marker:
+                continue
+            if " " in normalized_marker or len(normalized_marker) > 3:
+                matched = normalized_marker in text
+            else:
+                matched = normalized_marker in tokens
+            if matched:
+                hits += 1
+        if hits:
+            confidence = min(0.9, 0.62 + hits * 0.08)
+            scored.append(TopicMatch(name=topic_name, confidence=round(confidence, 4)))
+
+    scored.sort(key=lambda match: match.confidence, reverse=True)
+    return scored[:max_topics]
+
+
+def _merge_topic_matches(*groups: list[TopicMatch], max_topics: int = 3) -> list[TopicMatch]:
+    by_name: dict[str, TopicMatch] = {}
+    for group in groups:
+        for match in group:
+            current = by_name.get(match.name)
+            if current is None or match.confidence > current.confidence:
+                by_name[match.name] = match
+
+    matches = sorted(by_name.values(), key=lambda match: match.confidence, reverse=True)
+    return matches[:max_topics]
+
+
 def resolve_topics(
     *,
     source_categories: list[str] | None,
@@ -96,13 +137,14 @@ def resolve_topics(
     Returns:
         Список уникальных TopicMatch, отсортированный по confidence.
     """
-    # Шаг 1: rule-based
     rule_matches = map_source_categories(source_categories)
     if rule_matches:
         return rule_matches
 
-    # Шаг 2: zero-shot fallback
-    # Берём title + первые 300 символов body для классификации
+    lexical_matches = classify_topics_lexical(title=title, body=body)
+    if lexical_matches:
+        return lexical_matches
+
     text_for_classification = title
     if body:
         text_for_classification += ". " + body[:300]
@@ -118,4 +160,3 @@ def resolve_topics(
         )
 
     return zero_shot_matches
-

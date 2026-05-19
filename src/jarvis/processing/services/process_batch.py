@@ -5,8 +5,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import logging
 
+from sqlalchemy import select
+
 from jarvis.core.logging import log_event
+from jarvis.db.models import News
+from jarvis.db.session import SyncSessionLocal
 from jarvis.processing.services.process_article import process_one_news_article
+from jarvis.processing.services.pubsub import publish_articles_processed
 from jarvis.processing.services.qdrant_index import QdrantIndexer
 from jarvis.processing.services.select_batch import load_unprocessed_batch
 
@@ -48,6 +53,7 @@ def process_pending_news_batch(*, limit: int) -> ProcessBatchResult:
     processed_news_ids: list[int] = []
     failed_news_ids: list[int] = []
     skipped_count = 0
+    processed_chunk_count = 0
     qdrant_indexer = QdrantIndexer()
 
     for news in selected_news:
@@ -66,6 +72,7 @@ def process_pending_news_batch(*, limit: int) -> ProcessBatchResult:
 
         if result.status == "processed":
             processed_news_ids.append(news.id)
+            processed_chunk_count += result.chunk_count
         else:
             skipped_count += 1
 
@@ -83,4 +90,72 @@ def process_pending_news_batch(*, limit: int) -> ProcessBatchResult:
         "processing_batch_completed",
         **result.to_dict(),
     )
+    if processed_news_ids:
+        with SyncSessionLocal() as session:
+            event_cluster_ids = list(
+                session.scalars(
+                    select(News.event_cluster_id).where(News.id.in_(processed_news_ids))
+                ).all()
+            )
+        publish_articles_processed(
+            news_ids=processed_news_ids,
+            chunk_count=processed_chunk_count,
+            event_cluster_ids=[cluster_id for cluster_id in event_cluster_ids if cluster_id is not None],
+        )
+    return result
+
+
+def process_news_ids(news_ids: list[int], *, force: bool = False) -> ProcessBatchResult:
+    """Targeted dev/operator path for explicit article ids."""
+
+    processed_news_ids: list[int] = []
+    failed_news_ids: list[int] = []
+    skipped_count = 0
+    processed_chunk_count = 0
+    qdrant_indexer = QdrantIndexer()
+
+    for news_id in news_ids:
+        try:
+            article_result = process_one_news_article(
+                news_id,
+                qdrant_indexer=qdrant_indexer,
+                force=force,
+            )
+        except Exception as exc:
+            failed_news_ids.append(news_id)
+            log_event(
+                logger,
+                logging.ERROR,
+                "processing_article_failed",
+                news_id=news_id,
+                error=str(exc),
+            )
+            continue
+
+        if article_result.status == "processed":
+            processed_news_ids.append(news_id)
+            processed_chunk_count += article_result.chunk_count
+        else:
+            skipped_count += 1
+
+    result = ProcessBatchResult(
+        selected_count=len(news_ids),
+        processed_count=len(processed_news_ids),
+        skipped_count=skipped_count,
+        failed_count=len(failed_news_ids),
+        processed_news_ids=processed_news_ids,
+        failed_news_ids=failed_news_ids,
+    )
+    if processed_news_ids:
+        with SyncSessionLocal() as session:
+            event_cluster_ids = list(
+                session.scalars(
+                    select(News.event_cluster_id).where(News.id.in_(processed_news_ids))
+                ).all()
+            )
+        publish_articles_processed(
+            news_ids=processed_news_ids,
+            chunk_count=processed_chunk_count,
+            event_cluster_ids=[cluster_id for cluster_id in event_cluster_ids if cluster_id is not None],
+        )
     return result

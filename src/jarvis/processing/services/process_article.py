@@ -1,10 +1,4 @@
-"""Core article processing flow for Layer 2.
-
-Три параллельные ветки обработки (по FINAL_LAYER_2_GUIDE.md):
-  Ветка 1 (IR):     лемматизация → lemma_text для Qdrant FTS
-  Ветка 2 (NLP):   NER + topics + keywords
-  Ветка 3 (Embed): чанкинг → BGE-M3 embeddings → Qdrant upsert
-"""
+"""Core article processing flow for Layer 2."""
 
 from __future__ import annotations
 
@@ -12,26 +6,35 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from math import exp, log
-from uuid import uuid4
+import time
+from uuid import UUID, uuid5
 
 from sqlalchemy import delete, func, select
 
 from jarvis.core.logging import log_event
-from jarvis.db.models import Chunk, Entity, EntityCooccurrence, News, NewsEntity, NewsTopic, Source, Topic
+from jarvis.db.models import Chunk, Entity, News, NewsEntity, NewsTopic, Source, Topic
 from jarvis.db.session import SyncSessionLocal
 from jarvis.processing.ir.lemmatize import lemmatize_text
+from jarvis.processing.nlp.keywords import extract_keywords
 from jarvis.processing.services.chunking import build_chunks
+from jarvis.processing.services.cooccurrence import (
+    build_cooccurrence_edges,
+    decrement_cooccurrences,
+    upsert_cooccurrences,
+)
 from jarvis.processing.services.embedding_runtime import encode_texts
 from jarvis.processing.services.entity_extraction import ExtractedEntity, extract_entities
+from jarvis.processing.services.event_clustering import resolve_event_cluster_id
 from jarvis.processing.services.grading import derive_content_grade, derive_uncertainty
 from jarvis.processing.services.qdrant_index import IndexedChunk, QdrantIndexer
 from jarvis.processing.services.topic_mapping import TopicMatch, resolve_topics
-from jarvis.processing.services.cooccurrence import build_cooccurrence_edges, upsert_cooccurrences
-from jarvis.processing.services.event_clustering import resolve_event_cluster_id
-from jarvis.processing.nlp.keywords import extract_keywords
 
 
 logger = logging.getLogger(__name__)
+
+EMBEDDING_MODEL = "bge-m3"
+CHUNKING_VERSION = "adaptive-v1"
+POINT_ID_NAMESPACE = UUID("4c55f341-0db8-4e71-8c2d-d82bb8e522b5")
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +47,13 @@ class ProcessArticleResult:
     topic_count: int
     entity_count: int
     cooccurrence_edges: int
+
+
+def _deterministic_point_uuid(news_id: int, zone: str, chunk_index: int) -> UUID:
+    """Stable Qdrant point id for idempotent reprocessing."""
+
+    key = f"{news_id}|{zone}|{chunk_index}|{EMBEDDING_MODEL}|{CHUNKING_VERSION}"
+    return uuid5(POINT_ID_NAMESPACE, key)
 
 
 def _extract_source_categories(news: News) -> list[str]:
@@ -96,8 +106,14 @@ def _build_chunk_payload(
     keyword_texts: list[str],
     entity_names: list[str],
     entity_ids: list[int],
+    value_score: float,
+    freshness: float,
+    completeness: float,
+    cluster_support: float,
+    nlp_enriched: bool,
 ) -> dict[str, object]:
-    """Полный payload чанка для Qdrant (по FINAL_LAYER_2_GUIDE.md раздел 13.8)."""
+    """Full Qdrant payload for one chunk."""
+
     return {
         "news_id": news.id,
         "source_id": news.source_id,
@@ -114,6 +130,11 @@ def _build_chunk_payload(
         "urgency": news.urgency,
         "trust_score": trust_score,
         "content_grade": news.content_grade,
+        "is_uncertain": bool(news.is_uncertain),
+        "value_score": value_score,
+        "freshness": freshness,
+        "completeness": completeness,
+        "cluster_support": cluster_support,
         "event_cluster_id": news.event_cluster_id or news.id,
         "entities": entity_names,
         "entity_ids": entity_ids,
@@ -122,9 +143,9 @@ def _build_chunk_payload(
         "snippet_lead": news.snippet_lead or "",
         "lemma_text": chunk.lemma_text or chunk.text.lower(),
         "text_content": chunk.lemma_text or chunk.text,
-        "embedding_model": "bge-m3",
-        "chunking_version": "adaptive-v1",
-        "nlp_enriched": True,
+        "embedding_model": EMBEDDING_MODEL,
+        "chunking_version": CHUNKING_VERSION,
+        "nlp_enriched": nlp_enriched,
     }
 
 
@@ -142,6 +163,10 @@ def _load_existing_entity_mentions(session, news_id: int) -> list[tuple[int, int
             select(NewsEntity.entity_id, NewsEntity.mention_count).where(NewsEntity.news_id == news_id)
         ).all()
     )
+
+
+def _load_existing_entity_ids(session, news_id: int) -> list[int]:
+    return list(session.scalars(select(NewsEntity.entity_id).where(NewsEntity.news_id == news_id)).all())
 
 
 def _apply_entity_mentions(session, news_id: int, extracted_entities: list[ExtractedEntity]) -> int:
@@ -189,77 +214,125 @@ def _apply_entity_mentions(session, news_id: int, extracted_entities: list[Extra
     return applied_count
 
 
-def process_one_news_article(news_id: int, *, qdrant_indexer: QdrantIndexer | None = None) -> ProcessArticleResult:
-    """Process one article into topics, chunks and retrieval artifacts."""
+def _value_metrics(
+    *,
+    news: News,
+    trust_score: float,
+    has_full_content: bool,
+    cluster_source_count: int,
+) -> tuple[float, float, float, float]:
+    freshness = 1.0
+    if news.published_at:
+        age_hours = (datetime.now(timezone.utc) - news.published_at).total_seconds() / 3600
+        half_life = 1.0 if news.information_type == "breaking" else 24.0
+        freshness = exp(-log(2) * age_hours / half_life)
 
+    completeness = 1.0 if has_full_content else 0.3
+    cluster_support = min(1.0, cluster_source_count / 3.0)
+    value_score = round(trust_score * freshness * completeness * cluster_support, 4)
+    return value_score, round(freshness, 4), completeness, round(cluster_support, 4)
+
+
+def _topic_method(topic_matches: list[TopicMatch]) -> str:
+    return "rule-based" if any(match.confidence >= 0.9 for match in topic_matches) else "zero-shot"
+
+
+def _refresh_cluster_grade_payloads(cluster_id: int, indexer: QdrantIndexer) -> None:
+    """Recalculate grade/uncertainty for all articles in a cluster."""
+
+    qdrant_updates: list[tuple[list[str], dict[str, object]]] = []
+    with SyncSessionLocal() as session:
+        news_items = list(session.scalars(select(News).where(News.event_cluster_id == cluster_id)).all())
+        if not news_items:
+            return
+
+        cluster_source_count = int(
+            session.scalar(
+                select(func.count(func.distinct(News.source_id))).where(News.event_cluster_id == cluster_id)
+            )
+            or 1
+        )
+        cluster_support = round(min(1.0, cluster_source_count / 3.0), 4)
+        for item in news_items:
+            source = session.get(Source, item.source_id)
+            reliability = source.reliability if source is not None else "C"
+            item.content_grade = derive_content_grade(
+                reliability=reliability,
+                cluster_source_count=cluster_source_count,
+            )
+            item.is_uncertain = derive_uncertainty(
+                reliability=reliability,
+                cluster_source_count=cluster_source_count,
+            )
+            point_ids = [
+                str(point_id)
+                for point_id in session.scalars(
+                    select(Chunk.qdrant_point_id).where(Chunk.news_id == item.id)
+                ).all()
+            ]
+            if point_ids:
+                qdrant_updates.append(
+                    (
+                        point_ids,
+                        {
+                            "content_grade": item.content_grade,
+                            "is_uncertain": bool(item.is_uncertain),
+                            "cluster_support": cluster_support,
+                            "event_cluster_id": cluster_id,
+                        },
+                    )
+                )
+        session.commit()
+
+    for point_ids, payload in qdrant_updates:
+        indexer.update_payload(point_ids, payload)
+
+
+def process_one_news_article(
+    news_id: int,
+    *,
+    qdrant_indexer: QdrantIndexer | None = None,
+    force: bool = False,
+) -> ProcessArticleResult:
+    """Process one article into PostgreSQL side tables and Qdrant retrieval points."""
+
+    t_start = time.monotonic()
     indexer = qdrant_indexer or QdrantIndexer()
 
     with SyncSessionLocal() as session:
         news = session.get(News, news_id)
         if news is None:
-            return ProcessArticleResult(news_id=news_id, status="not_found", chunk_count=0, topic_count=0, entity_count=0, cooccurrence_edges=0)
-        if news.processed:
-            return ProcessArticleResult(news_id=news_id, status="already_processed", chunk_count=0, topic_count=0, entity_count=0, cooccurrence_edges=0)
+            return ProcessArticleResult(news_id, "not_found", 0, 0, 0, 0)
+        if news.processed and not force:
+            return ProcessArticleResult(news_id, "already_processed", 0, 0, 0, 0)
 
         source = session.get(Source, news.source_id)
         reliability = source.reliability if source is not None else "C"
         trust_score = source.trust_score if source is not None else 0.5
         source_name = source.name if source is not None else "Unknown"
-        cluster_source_count = _resolve_cluster_source_count(session, news)
 
-        # === Ветка 2: NLP-обогащение ===
         entity_text = _build_entity_text(news)
         extracted_entities = extract_entities(entity_text)
-
-        # Topics: rule-based → zero-shot fallback
         topic_matches = resolve_topics(
             source_categories=_extract_source_categories(news),
             title=news.title,
             body=news.content or "",
         )
-
-        # Keywords: YAKE
         keyword_results = extract_keywords(entity_text)
         keyword_texts = [kw.text for kw in keyword_results]
 
-        # === Event clustering ===
-        # Определяем реальный event_cluster_id поверх tentative
-        resolved_cluster_id = resolve_event_cluster_id(news)
-        if resolved_cluster_id != (news.event_cluster_id or news.id):
-            news.event_cluster_id = resolved_cluster_id
-            log_event(
-                logger,
-                logging.INFO,
-                "event_cluster_resolved",
-                news_id=news.id,
-                old_cluster_id=news.event_cluster_id,
-                new_cluster_id=resolved_cluster_id,
-            )
-            # Пересчитаем cluster_source_count с новым cluster_id
-            cluster_source_count = _resolve_cluster_source_count(session, news)
-
-        # === Ветка 1: IR-лемматизация ===
-        # Лемматизируем title и body для Qdrant full-text payload
         lemma_title = lemmatize_text(news.title)
-
-        # Degraded-path: если content пуст, используем snippet_lead
         has_full_content = bool((news.content or "").strip())
-        if has_full_content:
-            lemma_body = lemmatize_text(news.content)
-            entity_text_for_keywords = entity_text
-        else:
-            # Degraded: content отсутствует, используем snippet_lead
-            lemma_body = lemmatize_text(news.snippet_lead or "")
-            entity_text_for_keywords = "\n".join(
+        lemma_body = ""
+        if not has_full_content:
+            fallback_text = "\n".join(
                 part.strip()
                 for part in [news.title, news.snippet_lead or ""]
                 if part and part.strip()
             )
-            # Перезапускаем keywords на доступном тексте
-            keyword_results = extract_keywords(entity_text_for_keywords)
+            keyword_results = extract_keywords(fallback_text)
             keyword_texts = [kw.text for kw in keyword_results]
 
-        # === Ветка 3: Чанкинг + Embeddings ===
         prepared_chunks = build_chunks(
             title=news.title,
             body=news.content,
@@ -291,13 +364,12 @@ def process_one_news_article(news_id: int, *, qdrant_indexer: QdrantIndexer | No
             ),
             encoded_chunks[0].dense_vector if encoded_chunks else None,
         )
-        resolved_cluster_id = resolve_event_cluster_id(
-            news,
-            current_dense_vector=representative_vector,
-        )
         old_cluster_id = news.event_cluster_id or news.id
+        resolved_cluster_id = resolve_event_cluster_id(news, current_dense_vector=representative_vector)
+        news.event_cluster_id = resolved_cluster_id
+        session.flush()
+
         if resolved_cluster_id != old_cluster_id:
-            news.event_cluster_id = resolved_cluster_id
             log_event(
                 logger,
                 logging.INFO,
@@ -306,31 +378,36 @@ def process_one_news_article(news_id: int, *, qdrant_indexer: QdrantIndexer | No
                 old_cluster_id=old_cluster_id,
                 new_cluster_id=resolved_cluster_id,
             )
-            cluster_source_count = _resolve_cluster_source_count(session, news)
 
-        existing_point_ids = [
-            str(point_id)
-            for point_id in session.scalars(select(Chunk.qdrant_point_id).where(Chunk.news_id == news.id)).all()
-        ]
+        cluster_source_count = _resolve_cluster_source_count(session, news)
+        news.content_grade = derive_content_grade(
+            reliability=reliability,
+            cluster_source_count=cluster_source_count,
+        )
+        news.is_uncertain = derive_uncertainty(
+            reliability=reliability,
+            cluster_source_count=cluster_source_count,
+        )
+        value_score, freshness, completeness, cluster_support = _value_metrics(
+            news=news,
+            trust_score=trust_score,
+            has_full_content=has_full_content,
+            cluster_source_count=cluster_source_count,
+        )
+        nlp_enriched = bool(extracted_entities or topic_matches or keyword_texts)
 
         topic_names = [match.name for match in topic_matches]
+        entity_names_pre = [entity.name for entity in extracted_entities]
+        existing_point_ids = {
+            str(point_id)
+            for point_id in session.scalars(select(Chunk.qdrant_point_id).where(Chunk.news_id == news.id)).all()
+        }
         indexed_chunks: list[IndexedChunk] = []
         chunk_rows: list[Chunk] = []
 
-        # Собираем entity names/ids для payload (после _apply_entity_mentions)
-        # entity_ids_pre пустой — реальные id получаем только после flush entities в БД.
-        # После commit вызываем indexer.update_entity_payload() вторым проходом.
-        entity_names_pre = [e.name for e in extracted_entities]
-        entity_ids_pre: list[int] = []  # заполним после insert
-
-        # Инициализация — будут перезаписаны внутри try-блока после flush
-        entity_ids_post: list[int] = []
-        entity_names_post: list[str] = entity_names_pre
-
         for prepared_chunk, embedding_output in zip(prepared_chunks, encoded_chunks, strict=True):
-            point_uuid = uuid4()
+            point_uuid = _deterministic_point_uuid(news.id, prepared_chunk.zone, prepared_chunk.chunk_index)
             point_id = str(point_uuid)
-            # MVP payload: entity_names пока из extracted, entity_ids обновим позже
             payload = _build_chunk_payload(
                 news,
                 prepared_chunk,
@@ -339,7 +416,12 @@ def process_one_news_article(news_id: int, *, qdrant_indexer: QdrantIndexer | No
                 trust_score=trust_score,
                 keyword_texts=keyword_texts,
                 entity_names=entity_names_pre,
-                entity_ids=entity_ids_pre,
+                entity_ids=[],
+                value_score=value_score,
+                freshness=freshness,
+                completeness=completeness,
+                cluster_support=cluster_support,
+                nlp_enriched=nlp_enriched,
             )
             indexed_chunks.append(
                 IndexedChunk(
@@ -364,11 +446,16 @@ def process_one_news_article(news_id: int, *, qdrant_indexer: QdrantIndexer | No
 
         indexer.ensure_collection()
         indexer.upsert_chunks(indexed_chunks)
-
         new_point_ids = [chunk.point_id for chunk in indexed_chunks]
+
         try:
+            old_entity_ids = _load_existing_entity_ids(session, news.id)
+            if old_entity_ids:
+                decrement_cooccurrences(session, build_cooccurrence_edges(old_entity_ids))
+
             session.execute(delete(NewsTopic).where(NewsTopic.news_id == news.id))
             session.execute(delete(Chunk).where(Chunk.news_id == news.id))
+            session.flush()
 
             topics_by_name = _ensure_topics(session, topic_matches)
             for match in topic_matches:
@@ -382,66 +469,38 @@ def process_one_news_article(news_id: int, *, qdrant_indexer: QdrantIndexer | No
 
             session.add_all(chunk_rows)
             entity_count = _apply_entity_mentions(session, news.id, extracted_entities)
-
-            # Получаем реальные entity_ids после upsert (перезаписываем внешние переменные)
-            entity_ids_post = list(
-                session.scalars(
-                    select(NewsEntity.entity_id).where(NewsEntity.news_id == news.id)
-                ).all()
+            entity_ids_post = _load_existing_entity_ids(session, news.id)
+            entity_names_post = (
+                [
+                    entity.name
+                    for entity in session.scalars(select(Entity).where(Entity.id.in_(entity_ids_post))).all()
+                ]
+                if entity_ids_post
+                else entity_names_pre
             )
-            entity_names_post = [
-                e.name for e in session.scalars(
-                    select(Entity).where(Entity.id.in_(entity_ids_post))
-                ).all()
-            ] if entity_ids_post else entity_names_pre
 
-            # === Граф знаний: co-occurrence рёбра ===
-            # Собираем ID всех сущностей этой статьи и строим рёбра
-            entity_ids = list(
-                session.scalars(
-                    select(NewsEntity.entity_id).where(NewsEntity.news_id == news.id)
-                ).all()
-            )
-            coocc_edges = build_cooccurrence_edges(entity_ids)
+            coocc_edges = build_cooccurrence_edges(entity_ids_post)
             coocc_count = upsert_cooccurrences(session, coocc_edges)
 
-            news.content_grade = derive_content_grade(
-                reliability=reliability,
-                cluster_source_count=cluster_source_count,
-            )
-            news.is_uncertain = derive_uncertainty(
-                reliability=reliability,
-                cluster_source_count=cluster_source_count,
-            )
-            # value_score: полезность статьи для retrieval (раздел 16.2)
-            # formula: source_trust × freshness × completeness × cluster_support
-            freshness = 1.0
-            if news.published_at:
-                age_hours = (datetime.now(timezone.utc) - news.published_at).total_seconds() / 3600
-                # Экспоненциальное затухание: half-life = 24h для daily, 1h для breaking
-                half_life = 1.0 if news.information_type == "breaking" else 24.0
-                freshness = exp(-log(2) * age_hours / half_life)
-
-            completeness = 1.0 if has_full_content else 0.3
-            cluster_support = min(1.0, cluster_source_count / 3.0)  # нормализация
-
-            value_score = round(trust_score * freshness * completeness * cluster_support, 4)
-
             news.processed = True
+            processed_at = datetime.now(timezone.utc).isoformat()
+            processing_seconds = round(time.monotonic() - t_start, 3)
             extra = dict(news.extra or {})
             extra["processing"] = {
                 "status": "processed",
+                "processed_at": processed_at,
+                "processing_seconds": processing_seconds,
                 "chunk_count": len(chunk_rows),
                 "topic_names": topic_names,
-                "topic_method": "rule-based" if any(m.confidence >= 0.9 for m in topic_matches) else "zero-shot",
+                "topic_method": _topic_method(topic_matches),
                 "keywords": keyword_texts,
                 "entity_count": entity_count,
                 "cooccurrence_edges": coocc_count,
                 "cluster_source_count": cluster_source_count,
                 "value_score": value_score,
-                "freshness": round(freshness, 4),
+                "freshness": freshness,
                 "completeness": completeness,
-                "cluster_support": round(cluster_support, 4),
+                "cluster_support": cluster_support,
                 "fallback_body_used": not has_full_content and bool((news.snippet_lead or "").strip()),
             }
             news.extra = extra
@@ -450,34 +509,56 @@ def process_one_news_article(news_id: int, *, qdrant_indexer: QdrantIndexer | No
         except Exception:
             session.rollback()
             if new_point_ids:
-                indexer.delete_points(new_point_ids)
+                created_point_ids = [point_id for point_id in new_point_ids if point_id not in existing_point_ids]
+                indexer.delete_points(created_point_ids)
             raise
 
-        # Второй проход: обновляем entity payload в Qdrant реальными id из БД.
-        # set_payload меняет только указанные поля без повторной передачи векторов.
-        if new_point_ids and entity_ids_post:
+        if new_point_ids:
             try:
-                indexer.update_entity_payload(new_point_ids, entity_names_post, entity_ids_post)
+                indexer.update_payload(
+                    new_point_ids,
+                    {
+                        "entities": entity_names_post,
+                        "entity_ids": entity_ids_post,
+                        "content_grade": news.content_grade,
+                        "is_uncertain": bool(news.is_uncertain),
+                        "value_score": value_score,
+                        "freshness": freshness,
+                        "completeness": completeness,
+                        "cluster_support": cluster_support,
+                        "event_cluster_id": news.event_cluster_id or news.id,
+                        "nlp_enriched": nlp_enriched,
+                    },
+                )
             except Exception:
                 log_event(
                     logger,
                     logging.WARNING,
-                    "processing_entity_payload_update_failed",
+                    "processing_payload_update_failed",
                     news_id=news.id,
                     point_count=len(new_point_ids),
                 )
 
-        if existing_point_ids:
             try:
-                indexer.delete_points(existing_point_ids)
+                indexer.delete_stale_points_for_news(news.id, keep_point_ids=set(new_point_ids))
             except Exception:
                 log_event(
                     logger,
                     logging.WARNING,
                     "processing_stale_points_cleanup_failed",
                     news_id=news.id,
-                    stale_point_count=len(existing_point_ids),
                 )
+
+        try:
+            _refresh_cluster_grade_payloads(news.event_cluster_id or news.id, indexer)
+        except Exception:
+            log_event(
+                logger,
+                logging.WARNING,
+                "processing_cluster_grade_refresh_failed",
+                news_id=news.id,
+                cluster_id=news.event_cluster_id or news.id,
+            )
 
         log_event(
             logger,

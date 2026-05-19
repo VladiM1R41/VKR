@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from itertools import combinations
 import logging
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import select
 
 from jarvis.db.models import EntityCooccurrence
 
@@ -39,6 +39,8 @@ def _make_edge(entity_id_a: int, entity_id_b: int) -> CooccurrenceEdge:
     Это гарантирует отсутствие дубликатов (A,B) и (B,A).
     CHECK constraint в БД проверяет это же условие.
     """
+    if entity_id_a == entity_id_b:
+        raise ValueError("Co-occurrence edge requires two different entity ids.")
     if entity_id_a < entity_id_b:
         return CooccurrenceEdge(entity_id_a, entity_id_b)
     return CooccurrenceEdge(entity_id_b, entity_id_a)
@@ -106,6 +108,30 @@ def upsert_cooccurrences(session, edges: list[CooccurrenceEdge]) -> int:
                     co_mention_count=edge.count,
                 )
             )
+        count += 1
+
+    return count
+
+
+def decrement_cooccurrences(session, edges: list[CooccurrenceEdge]) -> int:
+    """Rollback article-level co-occurrence contribution before reprocess."""
+
+    if not edges:
+        return 0
+
+    count = 0
+    for edge in edges:
+        existing = session.scalar(
+            select(EntityCooccurrence).where(
+                EntityCooccurrence.entity_a_id == edge.entity_a_id,
+                EntityCooccurrence.entity_b_id == edge.entity_b_id,
+            )
+        )
+        if existing is None:
+            continue
+
+        existing.co_mention_count = max(0, int(existing.co_mention_count) - int(edge.count))
+        session.add(existing)
         count += 1
 
     return count

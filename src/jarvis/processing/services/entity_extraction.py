@@ -12,6 +12,22 @@ from jarvis.core.logging import log_event
 logger = logging.getLogger(__name__)
 _DEPENDENCY_WARNING_EMITTED = False
 
+_ENTITY_ALIASES: dict[tuple[str, str], tuple[str, str]] = {
+    ("ЦБ", "organization"): ("Банк России", "Банк России"),
+    ("ЦБ РФ", "organization"): ("Банк России", "Банк России"),
+    ("Центробанк", "organization"): ("Банк России", "Банк России"),
+    ("Центральный банк", "organization"): ("Банк России", "Банк России"),
+    ("Центральный банк России", "organization"): ("Банк России", "Банк России"),
+    ("Минфин", "organization"): ("Министерство финансов России", "Министерство финансов России"),
+    ("Минфин РФ", "organization"): ("Министерство финансов России", "Министерство финансов России"),
+    ("Министерство финансов", "organization"): ("Министерство финансов России", "Министерство финансов России"),
+    ("МИД", "organization"): ("Министерство иностранных дел России", "Министерство иностранных дел России"),
+    ("МИД РФ", "organization"): ("Министерство иностранных дел России", "Министерство иностранных дел России"),
+    ("Госдума", "organization"): ("Государственная дума", "Государственная дума"),
+    ("Государственная Дума", "organization"): ("Государственная дума", "Государственная дума"),
+    ("Совфед", "organization"): ("Совет Федерации", "Совет Федерации"),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ExtractedEntity:
@@ -53,6 +69,26 @@ def _runtime_with_tagger() -> dict[str, object] | None:
     return runtime
 
 
+def _apply_entity_alias(
+    *,
+    display_name: str,
+    normalized_name: str,
+    entity_type: str,
+) -> tuple[str, str, str]:
+    """Map frequent aliases to canonical Russian public entities."""
+
+    cleaned_display = " ".join(display_name.split())
+    cleaned_normal = " ".join(normalized_name.split())
+    canonical = _ENTITY_ALIASES.get((cleaned_normal, entity_type)) or _ENTITY_ALIASES.get(
+        (cleaned_display, entity_type)
+    )
+    if canonical is None:
+        return cleaned_display, cleaned_normal, entity_type
+
+    canonical_display, canonical_normal = canonical
+    return canonical_display, canonical_normal, entity_type
+
+
 def extract_entities(text: str) -> list[ExtractedEntity]:
     """Extract aggregated PER/ORG/LOC entities from article text."""
 
@@ -88,6 +124,11 @@ def extract_entities(text: str) -> list[ExtractedEntity]:
             "ORG": "organization",
             "LOC": "location",
         }[span.type]
+        display_name, normalized_name, entity_type = _apply_entity_alias(
+            display_name=display_name,
+            normalized_name=normalized_name,
+            entity_type=entity_type,
+        )
         key = (normalized_name, entity_type)
         mention_counts[key] = mention_counts.get(key, 0) + 1
         display_names.setdefault(key, display_name)

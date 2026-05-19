@@ -40,7 +40,8 @@ _ZERO_SHOT_CANDIDATES = [
 ]
 
 # Порог уверенности: темы ниже этого confidence не включаем
-_ZERO_SHOT_THRESHOLD = 0.35
+_ZERO_SHOT_THRESHOLD = 0.55
+_ZERO_SHOT_MIN_TOP_SCORE = 0.6
 
 # Максимум тем на статью
 _MAX_TOPICS = 3
@@ -103,4 +104,6 @@ def classify_topics_zero_shot(text: str, max_length: int = 512) -> list[TopicMat
 
     # Сортируем по уверенности и берём топ-3
     matches.sort(key=lambda m: m.confidence, reverse=True)
+    if not matches or matches[0].confidence < _ZERO_SHOT_MIN_TOP_SCORE:
+        return []
     return matches[:_MAX_TOPICS]
