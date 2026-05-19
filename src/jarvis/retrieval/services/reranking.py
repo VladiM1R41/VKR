@@ -57,6 +57,9 @@ class RerankingService:
             Reranked results sorted by descending rerank_score.
             If reranker unavailable, returns candidates with score 0.5.
         """
+        if not candidates:
+            return []
+
         model = _load_reranker()
         if model is None:
             # Graceful degradation: return as-is with neutral score

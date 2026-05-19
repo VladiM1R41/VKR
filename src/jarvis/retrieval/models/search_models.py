@@ -15,6 +15,12 @@ class SearchFilters(BaseModel):
     date_to: Optional[datetime] = None
     source_ids: Optional[list[int]] = None
     topics: Optional[list[str]] = None
+    zone: Optional[str] = Field(None, pattern="^(title|body)$")
+    content_grade: Optional[int] = Field(None, ge=1, le=6)
+    content_grade_max: Optional[int] = Field(None, ge=1, le=6)
+    urgency: Optional[str] = Field(None, pattern="^(critical|high|normal)$")
+    information_type: Optional[str] = Field(None, pattern="^(breaking|daily|analytics|reference)$")
+    event_cluster_id: Optional[int] = None
     language: str = "ru"
 
 
@@ -37,9 +43,22 @@ class SearchResult(BaseModel):
     snippet: str
     score: float
     rerank_score: Optional[float] = None
+    retrieval_score: Optional[float] = None
+    retrieval_mode: str = "qdrant_hybrid"
     topics: list[str] = Field(default_factory=list)
     entities: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
     published_at: Optional[datetime] = None
+    trust_score: float = 0.5
+    content_grade: int = 6
+    information_type: str = "daily"
+    urgency: str = "normal"
+    event_cluster_id: Optional[int] = None
+    value_score: Optional[float] = None
+    freshness: Optional[float] = None
+    completeness: Optional[float] = None
+    cluster_support: Optional[float] = None
+    is_uncertain: bool = False
     explanation: Optional[str] = None
 
 

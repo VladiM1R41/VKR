@@ -18,6 +18,7 @@ from jarvis.core.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
+_CACHE_VERSION = "l3-v5"
 
 
 class SearchCache:
@@ -40,7 +41,7 @@ class SearchCache:
     def _cache_key(self, query: str, filters_hash: str) -> str:
         """Generate cache key from query and filters."""
         normalized = " ".join(query.lower().strip().split())
-        raw = f"{normalized}|{filters_hash}"
+        raw = f"{_CACHE_VERSION}|{normalized}|{filters_hash}"
         return f"search:{hashlib.md5(raw.encode()).hexdigest()}"
 
     def get(self, query: str, filters_hash: str = "") -> Optional[dict]:
@@ -166,3 +167,85 @@ class SearchCache:
         except Exception as exc:
             logger.warning("cache_invalidate_by_topic_failed: %s", exc)
             return 0
+
+    def invalidate_all(self) -> int:
+        """Invalidate all exact search cache entries."""
+        try:
+            redis = self._get_redis()
+            deleted = 0
+            cursor = 0
+            while True:
+                cursor, keys = redis.scan(cursor, match="search:*", count=100)
+                if keys:
+                    deleted += int(redis.delete(*keys))
+                if cursor == 0:
+                    break
+            if deleted:
+                log_event(logger, logging.INFO, "search_cache_invalidate_all", deleted=deleted)
+            return deleted
+        except Exception as exc:
+            logger.warning("cache_invalidate_all_failed: %s", exc)
+            return 0
+
+    def invalidate_by_news_ids(self, news_ids: list[int]) -> int:
+        """Invalidate cached result sets containing any of the given news ids."""
+        target_ids = set(news_ids)
+        if not target_ids:
+            return 0
+        return self._invalidate_by_result_predicate(
+            lambda entry: int(entry.get("news_id") or 0) in target_ids,
+            event_name="cache_invalidate_by_news_ids",
+        )
+
+    def invalidate_by_source_ids(self, source_ids: list[int]) -> int:
+        """Invalidate cached result sets containing any of the given source ids."""
+        target_ids = set(source_ids)
+        if not target_ids:
+            return 0
+        return self._invalidate_by_result_predicate(
+            lambda entry: int(entry.get("source_id") or 0) in target_ids,
+            event_name="cache_invalidate_by_source_ids",
+        )
+
+    def _invalidate_by_result_predicate(self, predicate, *, event_name: str) -> int:
+        try:
+            redis = self._get_redis()
+            deleted = 0
+            cursor = 0
+            while True:
+                cursor, keys = redis.scan(cursor, match="search:*", count=100)
+                for key in keys or []:
+                    data = redis.get(key)
+                    if not data:
+                        continue
+                    result = json.loads(data)
+                    if any(predicate(entry) for entry in result.get("results", [])):
+                        redis.delete(key)
+                        deleted += 1
+                if cursor == 0:
+                    break
+            if deleted:
+                log_event(logger, logging.INFO, event_name, deleted=deleted)
+            return deleted
+        except Exception as exc:
+            logger.warning("%s_failed: %s", event_name, exc)
+            return 0
+
+    def invalidate_for_layer_event(self, event: dict) -> int:
+        """Invalidate cache from Layer 1/2 Pub/Sub payloads.
+
+        Accepted keys: news_ids, source_ids, topics. If the event shape is
+        unknown, all exact search cache entries are invalidated conservatively.
+        """
+        deleted = 0
+        handled = False
+        if event.get("news_ids"):
+            handled = True
+            deleted += self.invalidate_by_news_ids([int(item) for item in event["news_ids"]])
+        if event.get("source_ids"):
+            handled = True
+            deleted += self.invalidate_by_source_ids([int(item) for item in event["source_ids"]])
+        for topic in event.get("topics") or []:
+            handled = True
+            deleted += self.invalidate_by_topic(str(topic))
+        return deleted if handled else self.invalidate_all()

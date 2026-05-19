@@ -38,6 +38,17 @@ class SearchResult:
     trust_score: float = 0.5
     content_grade: int = 6
     information_type: str = "daily"
+    urgency: str = "normal"
+    value_score: Optional[float] = None
+    freshness: Optional[float] = None
+    completeness: Optional[float] = None
+    cluster_support: Optional[float] = None
+    event_cluster_id: Optional[int] = None
+    is_uncertain: bool = False
+    keywords: list[str] = field(default_factory=list)
+    entity_ids: list[int] = field(default_factory=list)
+    lemma_text: str = ""
+    retrieval_mode: str = "qdrant_hybrid"
     chunk_index: int = 0
     total_chunks: int = 1
     snippet_lead: str = ""
@@ -49,6 +60,7 @@ class QdrantSearchService:
 
     def __init__(self) -> None:
         self._settings = get_settings()
+        self.last_error: str | None = None
 
     def _client(self):
         from qdrant_client import QdrantClient
@@ -65,6 +77,12 @@ class QdrantSearchService:
         date_to: Optional[datetime] = None,
         source_ids: Optional[list[int]] = None,
         topics: Optional[list[str]] = None,
+        zone: Optional[str] = None,
+        content_grade: Optional[int] = None,
+        content_grade_max: Optional[int] = None,
+        urgency: Optional[str] = None,
+        information_type: Optional[str] = None,
+        event_cluster_id: Optional[int] = None,
         language: str = "ru",
         additional_queries: list[tuple[list[float], list[int], list[float]]] | None = None,
     ) -> list[SearchResult]:
@@ -123,6 +141,30 @@ class QdrantSearchService:
                     match=models.MatchAny(any=topics),
                 )
             )
+        if zone:
+            must_conditions.append(
+                models.FieldCondition(key="zone", match=models.MatchValue(value=zone))
+            )
+        if content_grade is not None:
+            must_conditions.append(
+                models.FieldCondition(key="content_grade", match=models.MatchValue(value=content_grade))
+            )
+        elif content_grade_max is not None:
+            must_conditions.append(
+                models.FieldCondition(key="content_grade", range=models.Range(lte=content_grade_max))
+            )
+        if urgency:
+            must_conditions.append(
+                models.FieldCondition(key="urgency", match=models.MatchValue(value=urgency))
+            )
+        if information_type:
+            must_conditions.append(
+                models.FieldCondition(key="information_type", match=models.MatchValue(value=information_type))
+            )
+        if event_cluster_id is not None:
+            must_conditions.append(
+                models.FieldCondition(key="event_cluster_id", match=models.MatchValue(value=event_cluster_id))
+            )
 
         query_filter = models.Filter(must=must_conditions)
 
@@ -166,6 +208,7 @@ class QdrantSearchService:
                 )
 
         try:
+            self.last_error = None
             results = client.query_points(
                 collection_name=self._settings.qdrant_collection_alias,
                 prefetch=prefetches,
@@ -175,6 +218,7 @@ class QdrantSearchService:
                 with_payload=True,
             )
         except Exception as exc:
+            self.last_error = str(exc)
             log_event(
                 logger,
                 logging.ERROR,
@@ -207,6 +251,16 @@ class QdrantSearchService:
                     trust_score=payload.get("trust_score", 0.5),
                     content_grade=payload.get("content_grade", 6),
                     information_type=payload.get("information_type", "daily"),
+                    urgency=payload.get("urgency", "normal"),
+                    value_score=payload.get("value_score"),
+                    freshness=payload.get("freshness"),
+                    completeness=payload.get("completeness"),
+                    cluster_support=payload.get("cluster_support"),
+                    event_cluster_id=payload.get("event_cluster_id"),
+                    is_uncertain=bool(payload.get("is_uncertain", False)),
+                    keywords=payload.get("keywords", []),
+                    entity_ids=payload.get("entity_ids", []),
+                    lemma_text=payload.get("lemma_text", ""),
                     chunk_index=payload.get("chunk_index", 0),
                     total_chunks=payload.get("total_chunks", 1),
                     snippet_lead=payload.get("snippet_lead", ""),
