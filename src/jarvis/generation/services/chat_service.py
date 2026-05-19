@@ -149,7 +149,7 @@ class ChatService:
         stmt = (
             select(ChatSession)
             .where(ChatSession.user_id == user_id)
-            .order_by(desc(ChatSession.last_message_at.nulls_first()))
+            .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
             .limit(limit)
         )
         return list(session.scalars(stmt).all())

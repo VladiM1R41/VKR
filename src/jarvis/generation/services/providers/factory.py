@@ -115,8 +115,16 @@ def build_primary_provider() -> LLMProvider | FallbackLLMProvider:
     settings = get_settings()
     primary = _make_provider(settings.jarvis_llm_provider)
     fallback_name = settings.jarvis_llm_fallback_provider.strip()
-    if not fallback_name:
-        return FallbackLLMProvider([primary, _FakeLLMProvider()])
-    fallback = _make_provider(fallback_name)
-    return FallbackLLMProvider([primary, fallback, _FakeLLMProvider()])
+    providers: list[LLMProvider] = [primary]
+    if fallback_name:
+        providers.append(_make_provider(fallback_name))
 
+    # Demo fallback is useful locally, but in production it would hide real LLM
+    # outages behind synthetic answers.
+    allow_fake_fallback = settings.app_env.strip().lower() not in {"prod", "production"}
+    if allow_fake_fallback and all(provider.provider_name != "fake" for provider in providers):
+        providers.append(_FakeLLMProvider())
+
+    if len(providers) == 1:
+        return providers[0]
+    return FallbackLLMProvider(providers)

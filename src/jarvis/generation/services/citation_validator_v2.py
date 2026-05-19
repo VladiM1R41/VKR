@@ -34,6 +34,9 @@ _POSTFIX_PATTERNS = [
     re.compile(rf"({_SOURCE_TOKEN})\s+(?:сообщает|пишет)\b", re.IGNORECASE),
     re.compile(rf"\(({_SOURCE_TOKEN})\)", re.IGNORECASE),
 ]
+_DOC_REF_RE = re.compile(r"\[\s*doc\s+(\d+)\s*\]", re.IGNORECASE)
+_PAREN_WITH_DOC_RE = re.compile(r"\(([^()]*\[\s*doc\s+\d+\s*\][^()]*)\)", re.IGNORECASE)
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,13 +71,24 @@ class CitationValidator:
             for doc in documents_used
             if doc.get("source") or doc.get("source_name")
         }
+        allowed_doc_refs = {
+            f"doc {int(doc['index'])}"
+            for doc in documents_used
+            if doc.get("index") is not None
+        }
+        if not allowed_doc_refs:
+            allowed_doc_refs = {
+                f"doc {idx}"
+                for idx, doc in enumerate(documents_used, start=1)
+                if doc.get("source") or doc.get("source_name") or doc.get("news_id") is not None
+            }
         cited_sources = self._extract_cited_sources(answer_text)
 
         valid_citations: list[str] = []
         invalid_citations: list[CitationIssue] = []
         for cited in cited_sources:
             normalized = self._normalize_source_name(cited)
-            if normalized in allowed_sources:
+            if normalized in allowed_sources or normalized in allowed_doc_refs:
                 valid_citations.append(cited)
                 continue
             invalid_citations.append(
@@ -96,6 +110,9 @@ class CitationValidator:
     def _normalize_source_name(self, name: str) -> str:
         normalized = re.sub(r"\s+", " ", name.strip().lower().replace("ё", "е"))
         normalized = _TRAILING_PUNCT_RE.sub("", normalized)
+        doc_match = _DOC_REF_RE.fullmatch(normalized)
+        if doc_match:
+            return f"doc {int(doc_match.group(1))}"
         synonym_map = {
             "риа новости": "риа",
             "ria novosti": "риа",
@@ -112,18 +129,42 @@ class CitationValidator:
         sources: list[str] = []
         seen: set[str] = set()
 
+        for match in _DOC_REF_RE.finditer(text):
+            self._append_source(sources, seen, f"Doc {int(match.group(1))}", allow_doc=True)
+
+        for match in _PAREN_WITH_DOC_RE.finditer(text):
+            inside = match.group(1)
+            without_doc = _DOC_REF_RE.sub("", inside)
+            without_date = _ISO_DATE_RE.sub("", without_doc)
+            for part in re.split(r"[,;]", without_date):
+                source = self._clean_source_candidate(part)
+                if source:
+                    self._append_source(sources, seen, source)
+
         for pattern in _PREFIX_PATTERNS + _POSTFIX_PATTERNS:
             for match in pattern.finditer(text):
                 source = self._clean_source_candidate(match.group(1))
-                if not source or not self._looks_like_source(source):
-                    continue
-                normalized = self._normalize_source_name(source)
-                if normalized in seen:
-                    continue
-                sources.append(source)
-                seen.add(normalized)
+                self._append_source(sources, seen, source)
 
         return sources
+
+    def _append_source(
+        self,
+        sources: list[str],
+        seen: set[str],
+        source: str,
+        *,
+        allow_doc: bool = False,
+    ) -> None:
+        if not source:
+            return
+        if not allow_doc and not self._looks_like_source(source):
+            return
+        normalized = self._normalize_source_name(source)
+        if normalized in seen:
+            return
+        sources.append(source)
+        seen.add(normalized)
 
     def _looks_like_source(self, value: str) -> bool:
         cleaned = self._clean_source_candidate(value)

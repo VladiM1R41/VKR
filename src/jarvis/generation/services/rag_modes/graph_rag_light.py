@@ -93,18 +93,19 @@ class GraphRAGLightService:
         news_map = {int(news.id): news for news in news_rows}
         source_ids = {int(news.source_id) for news in news_rows}
         sources = session.scalars(select(Source).where(Source.id.in_(source_ids))).all()
-        source_map = {int(source.id): str(source.name) for source in sources}
+        source_map = {int(source.id): source for source in sources}
 
         result: list[NewsWithContext] = []
         for news_id in unique_ids:
             news = news_map.get(news_id)
             if news is None:
                 continue
+            source = source_map.get(int(news.source_id))
             result.append(
                 NewsWithContext(
                     news_id=int(news.id),
                     source_id=int(news.source_id),
-                    source_name=source_map.get(int(news.source_id), "Unknown"),
+                    source_name=str(source.name) if source else "Unknown",
                     title=str(news.title),
                     content=str(news.content or ""),
                     snippet_lead=str(news.snippet_lead or ""),
@@ -114,10 +115,10 @@ class GraphRAGLightService:
                     topics=[],
                     entities=[],
                     published_at_str=str(news.published_at or ""),
-                    trust_score=float((news.extra or {}).get("trust_score", 0.5)),
+                    trust_score=float(source.trust_score) if source else 0.5,
                     content_grade=int(news.content_grade or 6),
-                    information_type=str((news.extra or {}).get("information_type", "daily")),
-                    urgency=str((news.extra or {}).get("urgency", "normal")),
+                    information_type=str(news.information_type or "daily"),
+                    urgency=str(news.urgency or "normal"),
                     event_cluster_id=getattr(news, "event_cluster_id", None),
                 )
             )

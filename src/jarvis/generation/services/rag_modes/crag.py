@@ -66,6 +66,7 @@ class CRAGService:
         retrieval_fn: RetrievalFn | None = None,
         user_id: int | None = None,
         intent: str = "FACTUAL",
+        conversation_context: str = "",
     ) -> CRAGResult:
         initial_quality = self.evaluate_context_quality(news_items)
         should_retry = initial_quality < 0.62 and retrieval_fn is not None
@@ -91,6 +92,7 @@ class CRAGService:
             news_items=selected_items,
             user_id=user_id,
             intent=intent,
+            conversation_context=conversation_context,
             rag_mode_override="crag",
         )
         return CRAGResult(

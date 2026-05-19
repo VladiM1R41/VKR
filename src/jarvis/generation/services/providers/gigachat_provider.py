@@ -52,6 +52,11 @@ class GigaChatProvider(HTTPLLMProvider):
         super().__init__(resolved, endpoint_path="/chat/completions")
         self._auth_key = settings.gigachat_auth_key
         self._scope = settings.gigachat_scope
+        self._tls_verify: bool | str = (
+            settings.gigachat_ca_bundle
+            if settings.gigachat_ca_bundle
+            else settings.gigachat_tls_verify
+        )
 
     # ── OAuth ────────────────────────────────────────────────────────────────
 
@@ -62,8 +67,9 @@ class GigaChatProvider(HTTPLLMProvider):
             "RqUID": str(uuid.uuid4()),
             "Content-Type": "application/x-www-form-urlencoded",
         }
-        # GigaChat использует собственный CA Sber — отключаем проверку TLS для совместимости
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+        # Keep TLS verification configurable: use the system CA by default,
+        # or pass a Sber CA bundle path through GIGACHAT_CA_BUNDLE.
+        async with httpx.AsyncClient(verify=self._tls_verify, timeout=15.0) as client:
             try:
                 resp = await client.post(
                     _OAUTH_URL,
@@ -117,7 +123,7 @@ class GigaChatProvider(HTTPLLMProvider):
         finally:
             self.config.api_key = saved_key
 
-    # ── Override HTTP client (отключаем SSL-верификацию для API Sber) ─────────
+    # ── Override HTTP client (GigaChat may require a custom Sber CA bundle) ──
 
     async def _post_with_retry(
         self,
@@ -126,7 +132,7 @@ class GigaChatProvider(HTTPLLMProvider):
         payload: dict[str, Any],
         headers: dict[str, str],
     ) -> httpx.Response:
-        """POST с retry и отключённой TLS-проверкой (CA Sber не в системном хранилище)."""
+        """POST with retry and configurable TLS verification."""
         from jarvis.generation.services.providers.base import (
             LLMRateLimitError,
             LLMTimeoutError,
@@ -138,7 +144,7 @@ class GigaChatProvider(HTTPLLMProvider):
         for attempt in range(1, attempts + 1):
             try:
                 async with httpx.AsyncClient(
-                    verify=False, timeout=self.config.timeout_sec
+                    verify=self._tls_verify, timeout=self.config.timeout_sec
                 ) as client:
                     response = await client.post(url, json=payload, headers=headers)
                     response.raise_for_status()

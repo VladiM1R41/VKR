@@ -40,9 +40,23 @@ class ResponseCache:
         rag_mode: str = "standard",
         query: str,
         document_ids: list[int],
+        prompt_version: str = "v1",
+        provider_key: str = "",
+        model_key: str = "",
     ) -> str:
-        # rag_mode включён в ключ чтобы standard/crag/self_rag не делили один бакет
-        raw = f"{mode}|{rag_mode}|{self._normalize_query(query)}|{','.join(str(doc_id) for doc_id in document_ids)}"
+        # rag_mode, prompt/model/provider включены в ключ, чтобы разные версии
+        # генерации не делили один устаревший ответ.
+        raw = "|".join(
+            [
+                mode,
+                rag_mode,
+                prompt_version,
+                provider_key,
+                model_key,
+                self._normalize_query(query),
+                ",".join(str(doc_id) for doc_id in document_ids),
+            ]
+        )
         return f"generation:{hashlib.md5(raw.encode()).hexdigest()}"
 
     def get(
@@ -52,11 +66,22 @@ class ResponseCache:
         rag_mode: str = "standard",
         query: str,
         document_ids: list[int],
+        prompt_version: str = "v1",
+        provider_key: str = "",
+        model_key: str = "",
     ) -> dict | None:
         if not self._settings.jarvis_rag_enable_cache:
             return None
         try:
-            key = self._cache_key(mode=mode, rag_mode=rag_mode, query=query, document_ids=document_ids)
+            key = self._cache_key(
+                mode=mode,
+                rag_mode=rag_mode,
+                query=query,
+                document_ids=document_ids,
+                prompt_version=prompt_version,
+                provider_key=provider_key,
+                model_key=model_key,
+            )
             data = self._get_redis().get(key)
             if not data:
                 return None
@@ -73,13 +98,23 @@ class ResponseCache:
         query: str,
         document_ids: list[int],
         result: dict,
+        prompt_version: str = "v1",
+        provider_key: str = "",
+        model_key: str = "",
         ttl_seconds: int = 300,
     ) -> None:
         if not self._settings.jarvis_rag_enable_cache:
             return
         try:
-            key = self._cache_key(mode=mode, rag_mode=rag_mode, query=query, document_ids=document_ids)
+            key = self._cache_key(
+                mode=mode,
+                rag_mode=rag_mode,
+                query=query,
+                document_ids=document_ids,
+                prompt_version=prompt_version,
+                provider_key=provider_key,
+                model_key=model_key,
+            )
             self._get_redis().setex(key, ttl_seconds, json.dumps(result, default=str))
         except Exception as exc:
             logger.warning("generation_cache_set_failed: %s", exc)
-

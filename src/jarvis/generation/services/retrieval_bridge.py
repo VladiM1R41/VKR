@@ -41,11 +41,11 @@ class RetrievalBridge:
             item.news_id: item.published_at.isoformat() if item.published_at else ""
             for item in results
         }
-        trust_map = {item.news_id: 0.5 for item in results}
-        grade_map = {item.news_id: 6 for item in results}
-        info_type_map = {item.news_id: "daily" for item in results}
-        urgency_map = {item.news_id: "normal" for item in results}
-        cluster_map = {item.news_id: None for item in results}
+        trust_map = {item.news_id: item.trust_score for item in results}
+        grade_map = {item.news_id: item.content_grade for item in results}
+        info_type_map = {item.news_id: item.information_type for item in results}
+        urgency_map = {item.news_id: item.urgency for item in results}
+        cluster_map = {item.news_id: item.event_cluster_id for item in results}
         return enrich_with_db_data(
             news_ids=news_ids,
             source_ids=source_ids,

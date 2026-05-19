@@ -23,6 +23,28 @@ from jarvis.generation.services.prompt_builder import (
     estimate_token_count,
 )
 
+_URGENCY_RANK: dict[str, int] = {
+    "critical": 3,
+    "high": 2,
+    "normal": 1,
+    "low": 0,
+}
+
+
+def _primary_score(item: "NewsWithContext") -> float:
+    return item.personalized_score if item.personalized_score is not None else item.score
+
+
+def _priority_key(item: "NewsWithContext") -> tuple[float, float, str, int, float]:
+    """Order context by relevance first, then trust and freshness signals."""
+    return (
+        _primary_score(item),
+        float(item.trust_score or 0.0),
+        item.published_at_str or "",
+        _URGENCY_RANK.get((item.urgency or "normal").lower(), 1),
+        item.score,
+    )
+
 
 # ───────────────────────────────────────────────────────────
 # Data-классы
@@ -65,17 +87,17 @@ def fetch_news_full(session, news_ids: list[int]) -> dict[int, News]:
     return {row.id: row for row in rows}
 
 
-def fetch_sources_map(session, source_ids: set[int]) -> dict[int, str]:
-    """Загрузить маппинг source_id → source.name.
+def fetch_sources_map(session, source_ids: set[int]) -> dict[int, Source]:
+    """Загрузить маппинг source_id → Source.
 
     Returns:
-        dict[source_id, source_name]
+        dict[source_id, Source]
     """
     if not source_ids:
         return {}
     stmt = select(Source).where(Source.id.in_(source_ids))
     rows = session.scalars(stmt).all()
-    return {row.id: row.name for row in rows}
+    return {row.id: row for row in rows}
 
 
 def enrich_with_db_data(
@@ -103,14 +125,16 @@ def enrich_with_db_data(
     """
     with SyncSessionLocal() as session:
         news_map = fetch_news_full(session, news_ids)
-        sources_map = fetch_sources_map(session, source_ids)
+        db_source_ids = {int(news.source_id) for news in news_map.values()}
+        sources_map = fetch_sources_map(session, source_ids | db_source_ids)
 
     results: list[NewsWithContext] = []
     for nid in news_ids:
         news = news_map.get(nid)
+        source = sources_map.get(int(news.source_id)) if news else None
         source_name = ""
         if news:
-            source_name = sources_map.get(news.source_id, "")
+            source_name = str(source.name) if source else ""
             # Если в БД есть более полный контент — используем его
             content = news.content if news.content else None
             snippet = news.snippet_lead if news.snippet_lead else None
@@ -134,11 +158,11 @@ def enrich_with_db_data(
             topics=topics_map.get(nid, []),
             entities=entities_map.get(nid, []),
             published_at_str=published_map.get(nid, ""),
-            trust_score=trust_map.get(nid, 0.5),
-            content_grade=grade_map.get(nid, 6),
-            information_type=info_type_map.get(nid, "daily"),
-            urgency=urgency_map.get(nid, "normal"),
-            event_cluster_id=cluster_map.get(nid),
+            trust_score=float(source.trust_score) if source else trust_map.get(nid, 0.5),
+            content_grade=int(news.content_grade) if news else grade_map.get(nid, 6),
+            information_type=str(news.information_type) if news else info_type_map.get(nid, "daily"),
+            urgency=str(news.urgency) if news else urgency_map.get(nid, "normal"),
+            event_cluster_id=getattr(news, "event_cluster_id", None) if news else cluster_map.get(nid),
         ))
     return results
 
@@ -158,7 +182,7 @@ class EventCluster:
     def priority_score(self) -> float:
         """Приоритет кластера = max personalized_score среди документов."""
         all_docs = self.representatives + self.supporting
-        scores = [d.personalized_score or d.score for d in all_docs if d.personalized_score is not None or d.score]
+        scores = [_primary_score(d) for d in all_docs if d.personalized_score is not None or d.score]
         return max(scores, default=0.0)
 
 
@@ -180,20 +204,21 @@ def group_by_event_clusters(
 
     clusters: list[EventCluster] = []
     for cid, items in groups.items():
-        # Сортируем по (trust_score * score) descending
-        items_sorted = sorted(
-            items,
-            key=lambda x: (x.trust_score * x.score, x.score),
-            reverse=True,
-        )
+        items_sorted = sorted(items, key=_priority_key, reverse=True)
         cluster = EventCluster(cluster_id=cid)
         cluster.representatives = [items_sorted[0]] if items_sorted else []
         # Берём до 2 supporting fragments
         cluster.supporting = items_sorted[1:3] if len(items_sorted) > 1 else []
         clusters.append(cluster)
 
-    # Сортируем кластеры по приоритету
-    clusters.sort(key=lambda c: c.priority_score, reverse=True)
+    # Сортируем кластеры по лучшему документу внутри кластера.
+    clusters.sort(
+        key=lambda c: max(
+            (_priority_key(item) for item in c.representatives + c.supporting),
+            default=(0.0, 0.0, "", 0, 0.0),
+        ),
+        reverse=True,
+    )
     return clusters
 
 
@@ -245,10 +270,8 @@ def trim_documents_to_budget(
             # Пробуем сократить content до remaining budget
             remaining = budget - used_tokens - overhead_tokens
             if remaining > 0:
-                # Грубая обрезка: берём первые N символов
-                # 1 токен ≈ 2 символа для русского
-                max_chars = remaining * 2
-                trimmed_content = doc.content[:max_chars] + "..."
+                max_chars = max(1, remaining * 2 - 3)
+                trimmed_content = doc.content[:max_chars].rstrip() + "..."
                 result.append(
                     DocumentContext(
                         index=doc.index,
@@ -290,12 +313,7 @@ def assemble_context_for_chat(
     Без группировки по кластерам — просто отсортированные по score документы,
     обрезанные по token budget.
     """
-    # Сортируем по score descending
-    sorted_items = sorted(
-        news_items,
-        key=lambda x: (x.personalized_score or x.score),
-        reverse=True,
-    )
+    sorted_items = sorted(news_items, key=_priority_key, reverse=True)
 
     documents = [
         DocumentContext(

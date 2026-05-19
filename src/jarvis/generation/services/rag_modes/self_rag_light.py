@@ -35,7 +35,7 @@ class SelfRAGLightService:
     """Lightweight retrieve/no-retrieve and relevance filtering wrapper."""
 
     def _tokenize(self, text: str) -> set[str]:
-        return {token.lower() for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9.-]+", text)}
+        return {token.lower() for token in re.findall(r"[^\W_]+(?:[.-][^\W_]+)*", text, flags=re.UNICODE)}
 
     def _looks_like_smalltalk(self, query: str) -> bool:
         normalized = " ".join(query.lower().split())
@@ -73,6 +73,7 @@ class SelfRAGLightService:
         retrieval_fn: RetrievalFn | None = None,
         user_id: int | None = None,
         intent: str = "FACTUAL",
+        conversation_context: str = "",
     ) -> SelfRAGLightResult:
         relevant_items = self.filter_relevant_documents(user_query, news_items)
 
@@ -95,6 +96,7 @@ class SelfRAGLightService:
             news_items=selected_items,
             user_id=user_id,
             intent=intent,
+            conversation_context=conversation_context,
             rag_mode_override="self_rag",
         )
         return SelfRAGLightResult(
