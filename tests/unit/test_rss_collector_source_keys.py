@@ -113,7 +113,9 @@ def test_rss_collector_marks_breaking_title_via_preclassifier() -> None:
 
     assert article is not None
     assert article.information_type == "breaking"
+    assert article.urgency == "high"
     assert article.extra["information_type_override"] == "pre_classifier_breaking"
+    assert article.extra["urgency"] == "high"
 
 
 def test_rss_collector_stores_kommersant_subtitle_but_keeps_raw_title() -> None:

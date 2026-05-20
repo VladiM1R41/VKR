@@ -67,6 +67,7 @@ async def test_rss_collector_stops_early_on_known_canonical_url() -> None:
 
     assert articles == []
     assert collector.last_items_total == 2
+    assert collector.last_known_duplicates_skipped == 1
 
 
 @pytest.mark.asyncio
@@ -209,6 +210,44 @@ async def test_rss_collector_sorts_items_before_stop_early_on_known() -> None:
 
     assert len(articles) == 1
     assert articles[0].canonical_url == "https://example.com/new"
+    assert collector.last_known_duplicates_skipped == 1
+
+
+@pytest.mark.asyncio
+async def test_rss_collector_counts_all_known_duplicates_before_fast_path_break() -> None:
+    xml = """
+    <rss><channel>
+      <item>
+        <title>Newest story</title>
+        <link>https://example.com/newest</link>
+        <pubDate>Sat, 11 Apr 2026 12:00:00 GMT</pubDate>
+      </item>
+      <item>
+        <title>Known one</title>
+        <link>https://example.com/known-1</link>
+        <pubDate>Sat, 11 Apr 2026 11:00:00 GMT</pubDate>
+      </item>
+      <item>
+        <title>Known two</title>
+        <link>https://example.com/known-2</link>
+        <pubDate>Sat, 11 Apr 2026 10:00:00 GMT</pubDate>
+      </item>
+    </channel></rss>
+    """
+    collector = RSSCollector(
+        _build_source(stop_early_on_known=True),
+        http_client=_FakeHttpClient(xml),
+        known_canonical_urls={
+            "https://example.com/known-1",
+            "https://example.com/known-2",
+        },
+    )
+
+    articles = await collector.collect()
+
+    assert len(articles) == 1
+    assert articles[0].canonical_url == "https://example.com/newest"
+    assert collector.last_known_duplicates_skipped == 2
 
 
 @pytest.mark.asyncio

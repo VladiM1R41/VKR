@@ -1,4 +1,5 @@
 from jarvis.ingestion.extraction.postprocess import apply_postprocess_rules, apply_pre_extraction_rules
+from tests.conftest import build_source_stub
 
 
 def test_remove_lines_starting_with_for_bfm_noise() -> None:
@@ -65,3 +66,20 @@ def test_pre_extraction_decompose_figure_with_data_attr_contract_key() -> None:
 
     assert "data-turbo-ad-id" not in cleaned_html
     assert "Полезный текст" in cleaned_html
+
+
+def test_mk_seed_postprocess_removes_max_tail_only() -> None:
+    source = build_source_stub("mk")
+    rules = source.config["postprocess_rules"]
+
+    cleaned_content, _ = apply_postprocess_rules(
+        content=(
+            "Первый полезный абзац новости.\n\n"
+            "Финальный полезный абзац новости.\n\n"
+            "Ваша надежная лента новостей — МК в MAX."
+        ),
+        snippet_lead=None,
+        rules=rules,
+    )
+
+    assert cleaned_content == "Первый полезный абзац новости.\n\nФинальный полезный абзац новости."

@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 
 from jarvis.ingestion.collectors.rss import RSSCollector
 from jarvis.ingestion.extraction.source_specific import extract_source_specific
+from jarvis.ingestion.services.enrich_source import _source_specific_min_length
 from tests.conftest import build_source_stub, load_rss_items
 
 
@@ -49,6 +50,27 @@ def test_rt_source_specific_extractor_collects_summary_text_and_tags() -> None:
     assert result["extra"]["tags"] == ["Европа", "Газ"]
 
 
+def test_rt_source_specific_keeps_inline_links_inside_sentences() -> None:
+    html = """
+    <html><body>
+      <div class="article__summary">
+        <p>Краткий лид статьи с достаточной длиной для уверенного отбора в source-specific extractor.</p>
+      </div>
+      <div class="article__text">
+        <p>Первый абзац сообщает, что <a href="/world">важная ссылка внутри предложения</a> должна остаться на той же строке.</p>
+        <p>Второй абзац основного текста продолжает тему и делает итоговый материал заметно длиннее порога в двести символов.</p>
+      </div>
+    </body></html>
+    """
+
+    result = extract_source_specific(html, _build_rt_source())
+
+    assert result is not None
+    assert result["content"] is not None
+    assert "что важная ссылка внутри предложения должна" in result["content"]
+    assert "\nважная ссылка внутри предложения\n" not in result["content"]
+
+
 def test_rt_source_specific_extractor_returns_none_content_when_too_short() -> None:
     html = """
     <html><body>
@@ -81,6 +103,39 @@ def test_rt_source_specific_extractor_collects_all_matching_blocks_per_selector(
         "Первый основной абзац статьи с деталями и контекстом.\n\n"
         "Второй основной абзац статьи тоже должен войти в content."
     )
+
+
+def test_bfm_source_specific_removes_inline_readalso_without_losing_paragraph_tail() -> None:
+    html = """
+    <html><body>
+      <section class="inner-news article-news">
+        <div class="current-article js-mediator-article">
+          <p class="about-article">Lead should be stored as metadata.</p>
+          <p>First article paragraph with enough detail for a valid body.</p>
+          <p>
+            <span class="see_also">
+              <span class="see_also__title">Read also:</span>
+              <a class="see_also__link" href="/news/1">Related card title</a>
+            </span>
+            Important article paragraph after related card with enough detail to prove it is not lost.
+          </p>
+          <p>Final article paragraph with enough context to keep the source-specific body over threshold.</p>
+        </div>
+      </section>
+    </body></html>
+    """
+
+    result = extract_source_specific(html, build_source_stub("bfm"))
+
+    assert result is not None
+    assert result["content"] == (
+        "First article paragraph with enough detail for a valid body.\n\n"
+        "Important article paragraph after related card with enough detail to prove it is not lost.\n\n"
+        "Final article paragraph with enough context to keep the source-specific body over threshold."
+    )
+    assert result["extra"]["source_lead"] == "Lead should be stored as metadata."
+    assert "Read also" not in result["content"]
+    assert "Related card title" not in result["content"]
 
 
 def test_rbc_fixture_no_link_jacking_and_description_unescaped() -> None:
@@ -160,3 +215,65 @@ def test_ria_fixture_maps_rian_type_into_source_content_type() -> None:
             return
 
     pytest.skip("RIA fixture sampled window did not expose rian:type")
+
+
+def test_ria_source_specific_preserves_quote_blocks_and_skips_related_cards() -> None:
+    html = """
+    <html><body>
+      <div class="article__body">
+        <div class="article__block" data-type="text">
+          <div class="article__text">МОСКВА, 26 апр — РИА Новости. Первый абзац перед цитатой.</div>
+        </div>
+        <div class="article__block" data-type="quote">
+          <div class="article__quote">
+            <div class="article__quote-bg">«</div>
+            <div class="article__quote-text">"Важная цитата", — написал он.</div>
+          </div>
+        </div>
+        <div class="article__block" data-type="article">
+          <a class="article__article-title">Связанная статья не должна попасть в текст</a>
+        </div>
+        <div class="article__block" data-type="banner">Реклама</div>
+        <div class="article__block" data-type="text">
+          <div class="article__text">Абзац после цитаты с продолжением новости.</div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+    result = extract_source_specific(html, build_source_stub("ria"))
+
+    assert result is not None
+    assert result["content"] == (
+        "МОСКВА, 26 апр — РИА Новости. Первый абзац перед цитатой.\n\n"
+        '"Важная цитата", — написал он.\n\n'
+        "Абзац после цитаты с продолжением новости."
+    )
+    assert "Связанная статья" not in result["content"]
+    assert "Реклама" not in result["content"]
+
+
+def test_ria_source_specific_accepts_short_structured_article() -> None:
+    html = """
+    <html><body>
+      <div class="article__body">
+        <div class="article__block" data-type="text">
+          <div class="article__text">Короткий, но валидный первый абзац новости РИА.</div>
+        </div>
+        <div class="article__block" data-type="text">
+          <div class="article__text">Второй абзац с полезной информацией и важной деталью для контекста.</div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+    result = extract_source_specific(html, build_source_stub("ria"))
+
+    assert result is not None
+    assert result["content"] is not None
+    assert 100 <= len(result["content"]) < 200
+
+
+def test_ria_source_specific_min_length_is_lower_than_default() -> None:
+    assert _source_specific_min_length(build_source_stub("ria")) == 100
+    assert _source_specific_min_length(build_source_stub("rt")) == 200

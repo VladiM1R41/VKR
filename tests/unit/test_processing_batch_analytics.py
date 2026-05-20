@@ -7,6 +7,7 @@ from jarvis.processing.services.batch_analytics import (
     _MIN_PMI_SCORE,
     _MIN_TERM_FREQUENCY,
     _MIN_BIGRAM_FREQUENCY,
+    _count_term_frequencies,
 )
 
 
@@ -64,6 +65,16 @@ class TestVocabularyUpdate:
         # Может быть не пусто если есть данные, но тип должен быть правильным
         assert isinstance(unigrams, list)
         assert isinstance(bigrams, list)
+
+    def test_doc_frequency_counts_distinct_documents(self):
+        doc_counter, collection_counter = _count_term_frequencies(
+            [["oil", "oil", "gas"], ["oil", "market"]]
+        )
+
+        assert doc_counter["oil"] == 2
+        assert collection_counter["oil"] == 3
+        assert doc_counter["gas"] == 1
+        assert collection_counter["gas"] == 1
 
 
 class TestCollocationUpdate:

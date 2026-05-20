@@ -56,7 +56,6 @@ async def test_enrich_source_pending_respects_crawl_delay(monkeypatch) -> None:
     assert sleep_calls == [2.5]
 
 
-@pytest.mark.asyncio
 async def test_enrich_source_pending_returns_skipped_locked_without_run(monkeypatch) -> None:
     source = SimpleNamespace(
         id=13,
@@ -84,7 +83,7 @@ async def test_enrich_source_pending_returns_skipped_locked_without_run(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_enrich_single_article_marks_recall_as_ok(monkeypatch) -> None:
+async def test_enrich_single_article_marks_recall_as_partial(monkeypatch) -> None:
     article = SimpleNamespace(id=201, url="https://example.com/article", snippet_lead="lead")
     source = SimpleNamespace(
         id=13,
@@ -96,6 +95,8 @@ async def test_enrich_single_article_marks_recall_as_ok(monkeypatch) -> None:
     class _FakeResponse:
         status_code = 200
         text = "<html><body><article>stub</article></body></html>"
+        content = text.encode("utf-8")
+        headers = {}
         url = "https://example.com/article"
 
     class _FakeHttpClientSingle:
@@ -117,7 +118,7 @@ async def test_enrich_single_article_marks_recall_as_ok(monkeypatch) -> None:
     )
 
     assert (success, failed) == (True, False)
-    assert persisted["content_status"] == "ok"
+    assert persisted["content_status"] == "partial"
     assert persisted["extraction_method"] == "trafilatura_recall"
     assert persisted["content"] == "Recovered content from recall path."
 
@@ -151,6 +152,43 @@ async def test_enrich_source_pending_schedules_followup_when_more_work_appears(m
     assert followup_calls == [("BFM.ru", 1)]
 
 
+@pytest.mark.asyncio
+async def test_enrich_source_pending_logs_followup_enqueue_failure(monkeypatch) -> None:
+    source = SimpleNamespace(
+        id=13,
+        name="BFM.ru",
+        crawl_delay=1.0,
+        config={"full_text_method": "html_trafilatura"},
+    )
+    pending_articles = [SimpleNamespace(id=101, url="https://example.com/1", snippet_lead="a")]
+    enqueue_errors: list[dict] = []
+
+    monkeypatch.setattr(service, "_load_source_by_name", lambda name: source)
+    monkeypatch.setattr(service, "_load_pending_articles", lambda source_id, limit: pending_articles)
+    monkeypatch.setattr(service, "_start_run", lambda source_id: 73)
+    monkeypatch.setattr(service, "acquire_enrichment_lock", _fake_acquired_lock)
+    monkeypatch.setattr(service, "clear_enrichment_pending", lambda source_id: _async_none())
+    monkeypatch.setattr(service.httpx, "AsyncClient", lambda *args, **kwargs: _FakeAsyncClient())
+    monkeypatch.setattr(service, "_enrich_single_article", lambda **kwargs: _async_pair(True, False))
+    monkeypatch.setattr(service, "_finalize_run", lambda **kwargs: None)
+    monkeypatch.setattr(service, "consume_enrichment_rerun", lambda source_id: _async_true())
+    monkeypatch.setattr(service, "_has_pending_articles", lambda source_id: True)
+    monkeypatch.setattr(service, "_schedule_followup_enrichment", lambda source, limit: _async_raise(RuntimeError("broker down")))
+    monkeypatch.setattr(service, "_log_enrichment_enqueue_error", lambda **kwargs: enqueue_errors.append(kwargs))
+
+    result = await service.enrich_source_pending_once("BFM.ru", limit=1)
+
+    assert result["followup_needed"] is True
+    assert enqueue_errors == [
+        {
+            "run_id": 73,
+            "source_id": 13,
+            "source_name": "BFM.ru",
+            "error_message": "broker down",
+        }
+    ]
+
+
 async def _async_pair(first, second):
     return first, second
 
@@ -174,3 +212,7 @@ async def _async_true():
 async def _async_followup(store: list[tuple[str, int]], source_name: str, limit: int):
     store.append((source_name, limit))
     return True
+
+
+async def _async_raise(exc: Exception):
+    raise exc

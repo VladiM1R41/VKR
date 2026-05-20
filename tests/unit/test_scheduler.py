@@ -93,5 +93,34 @@ async def test_dispatch_due_sources_enqueues_due_source(monkeypatch) -> None:
     assert enqueue_calls == [source.name]
 
 
+@pytest.mark.asyncio
+async def test_dispatch_due_sources_clears_pending_when_enqueue_fails(monkeypatch) -> None:
+    source = _build_source(last_crawled=None)
+    cleared_pending: list[int] = []
+    events: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(scheduler, "_load_active_sources", lambda source_name=None: [source])
+    monkeypatch.setattr(scheduler, "is_collection_locked", lambda source_id: _async_result(False))
+    monkeypatch.setattr(scheduler, "mark_collection_pending", lambda source_id, ttl_seconds: _async_result(True))
+    monkeypatch.setattr(scheduler, "clear_collection_pending", lambda source_id: _async_clear(cleared_pending, source_id))
+    monkeypatch.setattr(scheduler, "_enqueue_collect_source", lambda source_name: (_ for _ in ()).throw(RuntimeError("broker down")))
+    monkeypatch.setattr(
+        scheduler,
+        "log_event",
+        lambda logger, level, event, **kwargs: events.append((event, kwargs)),
+    )
+
+    result = await scheduler.dispatch_due_sources_once()
+
+    assert result["scheduled_count"] == 0
+    assert result["entries"][0]["reason"] == "enqueue_failed"
+    assert cleared_pending == [source.id]
+    assert events[0][0] == "collect_source_enqueue_failed"
+
+
 async def _async_result(value):
     return value
+
+
+async def _async_clear(store: list[int], source_id: int):
+    store.append(source_id)

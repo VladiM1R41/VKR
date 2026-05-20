@@ -10,12 +10,15 @@ def test_health_report_table_includes_latest_published_column() -> None:
                 "health_status": "green",
                 "consecutive_failures": 0,
                 "parse_success": 1.0,
+                "parse_success_24h": 0.75,
+                "backpressure_skips_24h": 2,
                 "extraction_success": 0.98,
                 "avg_latency_minutes": 12.5,
                 "source_utility": 0.44,
                 "latest_published_at": "2026-04-13 10:15:00+00:00",
                 "staleness_hours": 0.5,
                 "runs_24h": 48,
+                "attempted_runs_24h": 46,
                 "items_new_24h": 320,
                 "items_in_last_feed": 916,
             }
@@ -23,4 +26,9 @@ def test_health_report_table_includes_latest_published_column() -> None:
     )
 
     assert "latest_pub" in table
+    assert "parse24h" in table
+    assert "bp_skip24h" in table
+    assert "attempt24h" in table
+    assert "2" in table
+    assert "0.75" in table
     assert "2026-04-13 10:15:00+00:00" in table

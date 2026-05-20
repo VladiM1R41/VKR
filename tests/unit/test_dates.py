@@ -22,6 +22,15 @@ def test_parse_feed_datetime_invalid() -> None:
     assert inferred is True
 
 
+def test_parse_feed_datetime_marks_naive_as_inferred() -> None:
+    dt, inferred = parse_feed_datetime("Tue, 07 Apr 2026 19:25:28")
+
+    assert dt is not None
+    assert dt.tzinfo == timezone.utc
+    assert dt.isoformat() == "2026-04-07T19:25:28+00:00"
+    assert inferred is True
+
+
 @pytest.mark.parametrize("source_key", RSS_SOURCE_KEYS)
 def test_parse_feed_datetime_works_on_fixture_dates(source_key: str) -> None:
     items = load_rss_items(source_key)[:5]

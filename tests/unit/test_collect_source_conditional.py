@@ -117,7 +117,6 @@ async def test_collect_source_once_returns_skipped_304(monkeypatch) -> None:
     assert finalized["received_last_modified"] == "Sat, 11 Apr 2026 10:00:00 GMT"
 
 
-@pytest.mark.asyncio
 async def test_collect_source_once_enqueues_deferred_html_enrichment(monkeypatch) -> None:
     source = SimpleNamespace(
         id=13,
@@ -156,6 +155,50 @@ async def test_collect_source_once_enqueues_deferred_html_enrichment(monkeypatch
     assert result["items_new"] == 1
     assert enqueue_calls == [("BFM.ru", 1)]
     assert finalized["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_collect_source_once_records_enqueue_failure_without_failing_run(monkeypatch) -> None:
+    source = SimpleNamespace(
+        id=17,
+        name="BFM.ru",
+        type="rss",
+        priority="periodic",
+        trust_score=0.8,
+        config={"source_key": "bfm", "full_text_method": "html_trafilatura"},
+    )
+    finalized = {}
+    logged_errors: list[tuple[tuple, dict]] = []
+
+    monkeypatch.setattr(service, "_load_source_by_name", lambda name: source)
+    monkeypatch.setattr(service, "_check_backpressure", lambda _source: None)
+    monkeypatch.setattr(service, "_start_run", lambda source_id: 108)
+    monkeypatch.setattr(service, "_load_known_canonical_urls", lambda source_id: set())
+    monkeypatch.setattr(service, "acquire_collection_lock", _fake_acquired_lock)
+    monkeypatch.setattr(service, "clear_collection_pending", lambda source_id: _async_none())
+    monkeypatch.setattr(service.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(
+        service.CollectorDispatcher,
+        "get_collector",
+        lambda source, client, known_canonical_urls=None: _FreshCollector(),
+    )
+    monkeypatch.setattr(service, "_persist_articles", lambda run_id, source_id, articles: ([901], 0, 0))
+    monkeypatch.setattr(service, "_publish_inserted_article_signals", lambda **kwargs: _async_none())
+    monkeypatch.setattr(service, "_enqueue_html_enrichment", lambda source, limit: _async_raise(RuntimeError("broker down")))
+    monkeypatch.setattr(service, "_log_run_error", lambda *args, **kwargs: logged_errors.append((args, kwargs)))
+
+    def _fake_finalize_run(**kwargs):
+        finalized.update(kwargs)
+
+    monkeypatch.setattr(service, "_finalize_run", _fake_finalize_run)
+
+    result = await service.collect_source_once("BFM.ru")
+
+    assert result["status"] == "partial"
+    assert finalized["status"] == "partial"
+    assert logged_errors[0][0][2] == "enqueue_failed"
+    assert "enqueue_failed" in logged_errors[0][0][3]
+    assert logged_errors[0][1]["mark_run_failed"] is False
 
 
 @pytest.mark.asyncio
@@ -211,12 +254,249 @@ async def test_collect_source_once_returns_success_on_same_last_build_date(monke
     assert finalized["received_last_build_date"] == "Sat, 11 Apr 2026 10:00:00 GMT"
 
 
+@pytest.mark.asyncio
+async def test_collect_source_once_logs_backpressure_warn_and_continues(monkeypatch) -> None:
+    source = SimpleNamespace(
+        id=14,
+        name="Test source",
+        type="rss",
+        priority="periodic",
+        trust_score=0.9,
+        config={"source_key": "test"},
+    )
+    events: list[tuple[int, str, dict]] = []
+
+    monkeypatch.setattr(service, "_load_source_by_name", lambda name: source)
+    monkeypatch.setattr(
+        service,
+        "_check_backpressure",
+        lambda _source: {"decision": "warn", "unprocessed_count": 1234},
+    )
+    monkeypatch.setattr(service, "_start_run", lambda source_id: 101)
+    monkeypatch.setattr(service, "_load_known_canonical_urls", lambda source_id: set())
+    monkeypatch.setattr(service, "acquire_collection_lock", _fake_acquired_lock)
+    monkeypatch.setattr(service, "clear_collection_pending", lambda source_id: _async_none())
+    monkeypatch.setattr(service.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(
+        service.CollectorDispatcher,
+        "get_collector",
+        lambda source, client, known_canonical_urls=None: _SameBuildDateCollector(),
+    )
+    monkeypatch.setattr(
+        service,
+        "log_event",
+        lambda logger, level, event, **kwargs: events.append((level, event, kwargs)),
+    )
+    monkeypatch.setattr(service, "_finalize_run", lambda **kwargs: None)
+
+    result = await service.collect_source_once("Test source")
+
+    assert result["status"] == "success"
+    assert "source_run_backpressure_warn" in [event for _, event, _ in events]
+    warn_event = next(item for item in events if item[1] == "source_run_backpressure_warn")
+    assert warn_event[2]["unprocessed_count"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_collect_source_once_persists_backpressure_skip_run(monkeypatch) -> None:
+    source = SimpleNamespace(
+        id=145,
+        name="Test source",
+        type="rss",
+        priority="periodic",
+        trust_score=0.7,
+        config={"source_key": "test"},
+    )
+    finalized: dict = {}
+    events: list[tuple[int, str, dict]] = []
+
+    monkeypatch.setattr(service, "_load_source_by_name", lambda name: source)
+    monkeypatch.setattr(
+        service,
+        "_check_backpressure",
+        lambda _source: {
+            "decision": "skip",
+            "unprocessed_count": 12000,
+            "reason": "circuit_breaker_open",
+        },
+    )
+    monkeypatch.setattr(service, "_start_run", lambda source_id: 202)
+    monkeypatch.setattr(service, "acquire_collection_lock", _fake_acquired_lock)
+    monkeypatch.setattr(service, "clear_collection_pending", lambda source_id: _async_none())
+    monkeypatch.setattr(service, "_finalize_run", lambda **kwargs: finalized.update(kwargs))
+    monkeypatch.setattr(
+        service,
+        "log_event",
+        lambda logger, level, event, **kwargs: events.append((level, event, kwargs)),
+    )
+
+    result = await service.collect_source_once("Test source")
+
+    assert result == {
+        "source": "Test source",
+        "status": "skipped_backpressure",
+        "reason": "circuit_breaker_open",
+        "run_id": 202,
+        "unprocessed_count": 12000,
+    }
+    assert finalized["run_id"] == 202
+    assert finalized["status"] == "skipped_backpressure"
+    assert finalized["items_total"] == 0
+    assert finalized["items_new"] == 0
+    skip_event = next(item for item in events if item[1] == "source_run_skipped_backpressure")
+    assert skip_event[2]["run_id"] == 202
+    assert skip_event[2]["reason"] == "circuit_breaker_open"
+
+
+@pytest.mark.asyncio
+async def test_collect_source_once_publishes_inserted_article_signals(monkeypatch) -> None:
+    source = SimpleNamespace(
+        id=15,
+        name="Test source",
+        type="rss",
+        priority="periodic",
+        trust_score=0.9,
+        config={"source_key": "test"},
+    )
+    published_calls: list[tuple[int, int, list[int]]] = []
+
+    monkeypatch.setattr(service, "_load_source_by_name", lambda name: source)
+    monkeypatch.setattr(service, "_check_backpressure", lambda _source: None)
+    monkeypatch.setattr(service, "_start_run", lambda source_id: 102)
+    monkeypatch.setattr(service, "_load_known_canonical_urls", lambda source_id: set())
+    monkeypatch.setattr(service, "acquire_collection_lock", _fake_acquired_lock)
+    monkeypatch.setattr(service, "clear_collection_pending", lambda source_id: _async_none())
+    monkeypatch.setattr(service.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(
+        service.CollectorDispatcher,
+        "get_collector",
+        lambda source, client, known_canonical_urls=None: _FreshCollector(),
+    )
+    monkeypatch.setattr(service, "_persist_articles", lambda run_id, source_id, articles: ([901, 902], 0, 0))
+    monkeypatch.setattr(
+        service,
+        "_publish_inserted_article_signals",
+        lambda *, source_id, run_id, inserted_ids: _async_publish(published_calls, source_id, run_id, inserted_ids),
+    )
+    monkeypatch.setattr(service, "_finalize_run", lambda **kwargs: None)
+
+    result = await service.collect_source_once("Test source")
+
+    assert result["status"] == "success"
+    assert published_calls == [(15, 102, [901, 902])]
+
+
+@pytest.mark.asyncio
+async def test_collect_source_once_adds_known_duplicate_skips_to_duplicate_metric(monkeypatch) -> None:
+    source = SimpleNamespace(
+        id=16,
+        name="Repeat source",
+        type="rss",
+        priority="periodic",
+        trust_score=0.9,
+        config={"source_key": "test"},
+    )
+    finalized = {}
+
+    class _CollectorWithKnownDuplicates(_FreshCollector):
+        def __init__(self):
+            super().__init__()
+            self.last_item_errors = []
+            self.last_known_duplicates_skipped = 4
+
+        async def collect(self):
+            return ["article-1"]
+
+    monkeypatch.setattr(service, "_load_source_by_name", lambda name: source)
+    monkeypatch.setattr(service, "_check_backpressure", lambda _source: None)
+    monkeypatch.setattr(service, "_start_run", lambda source_id: 103)
+    monkeypatch.setattr(service, "_load_known_canonical_urls", lambda source_id: {"https://example.com/known"})
+    monkeypatch.setattr(service, "acquire_collection_lock", _fake_acquired_lock)
+    monkeypatch.setattr(service, "clear_collection_pending", lambda source_id: _async_none())
+    monkeypatch.setattr(service.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(
+        service.CollectorDispatcher,
+        "get_collector",
+        lambda source, client, known_canonical_urls=None: _CollectorWithKnownDuplicates(),
+    )
+    monkeypatch.setattr(service, "_persist_articles", lambda run_id, source_id, articles: ([901], 1, 0))
+    monkeypatch.setattr(service, "_publish_inserted_article_signals", lambda **kwargs: _async_none())
+
+    def _fake_finalize_run(**kwargs):
+        finalized.update(kwargs)
+
+    monkeypatch.setattr(service, "_finalize_run", _fake_finalize_run)
+
+    result = await service.collect_source_once("Repeat source")
+
+    assert result["status"] == "success"
+    assert result["items_new"] == 1
+    assert result["items_duplicate"] == 5
+    assert finalized["items_duplicate"] == 5
+
+
+@pytest.mark.asyncio
+async def test_publish_inserted_article_signals_emits_batch_and_breaking_only(monkeypatch) -> None:
+    batch_calls: list[tuple[int, list[int]]] = []
+    breaking_calls: list[tuple[int, int | None, str]] = []
+
+    monkeypatch.setattr(
+        service,
+        "_load_inserted_news_metadata",
+        lambda inserted_ids: [
+            {"news_id": 901, "event_cluster_id": 901, "urgency": "high"},
+            {"news_id": 902, "event_cluster_id": 902, "urgency": "normal"},
+            {"news_id": 903, "event_cluster_id": 903, "urgency": "critical"},
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "publish_new_articles_ready",
+        lambda source_id, news_ids: _async_record_batch(batch_calls, source_id, news_ids),
+    )
+    monkeypatch.setattr(
+        service,
+        "publish_breaking_event",
+        lambda *, news_id, event_cluster_id, urgency: _async_record_breaking(
+            breaking_calls,
+            news_id,
+            event_cluster_id,
+            urgency,
+        ),
+    )
+
+    await service._publish_inserted_article_signals(
+        source_id=15,
+        run_id=102,
+        inserted_ids=[901, 902, 903],
+    )
+
+    assert batch_calls == [(15, [901, 902, 903])]
+    assert breaking_calls == [
+        (901, 901, "high"),
+        (903, 903, "critical"),
+    ]
+
+
 async def _async_enqueue(store: list[tuple[str, int]], source_name: str, limit: int):
     store.append((source_name, limit))
 
 
+async def _async_publish(
+    store: list[tuple[int, int, list[int]]],
+    source_id: int,
+    run_id: int,
+    inserted_ids: list[int],
+):
+    store.append((source_id, run_id, inserted_ids))
+
+
 async def _async_none():
     return None
+
+
+async def _async_raise(exc: Exception):
+    raise exc
 
 
 async def _async_false():
@@ -226,6 +506,24 @@ async def _async_false():
 async def _async_record(store: list[tuple[int, int]], source_id: int, ttl: int):
     store.append((source_id, ttl))
     return True
+
+
+async def _async_record_batch(
+    store: list[tuple[int, list[int]]],
+    source_id: int,
+    news_ids: list[int],
+):
+    store.append((source_id, news_ids))
+    return "batch-123"
+
+
+async def _async_record_breaking(
+    store: list[tuple[int, int | None, str]],
+    news_id: int,
+    event_cluster_id: int | None,
+    urgency: str,
+):
+    store.append((news_id, event_cluster_id, urgency))
 
 
 def test_persist_articles_counts_duplicate_and_sets_tentative_event_cluster(monkeypatch) -> None:

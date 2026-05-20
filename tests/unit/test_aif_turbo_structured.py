@@ -101,3 +101,50 @@ def test_aif_turbo_structured_falls_back_to_yandex_fulltext_when_turbo_is_empty(
 
     assert result["content"] == "Fallback paragraph.\nSecond fallback paragraph."
     assert result["extraction_method"] == "rss_yandex_fulltext_fallback"
+
+
+def test_aif_articles_prefers_yandex_fulltext_but_keeps_turbo_metadata() -> None:
+    item_xml = """
+    <item>
+      <description><![CDATA[Lead text]]></description>
+      <turbo:content><![CDATA[
+        <h2>Turbo heading</h2>
+        <p>Broken short turbo text.</p>
+        <figure><img src="https://example.com/body.jpg"/><figcaption>Body image</figcaption></figure>
+      ]]></turbo:content>
+      <yandex:full-text><![CDATA[
+        <p>Full yandex paragraph with the beginning that is missing from broken turbo.</p>
+        <p>Second full yandex paragraph with enough context for production collection.</p>
+      ]]></yandex:full-text>
+    </item>
+    """
+    item = BeautifulSoup(item_xml, "xml").find("item")
+
+    result = extract_rss_fulltext(
+        item=item,
+        method="rss_turbo_structured",
+        config={
+            "source_key": "aif_articles",
+            "full_text_tag": "turbo:content",
+            "fallback_full_text_tag": "yandex:full-text",
+            "postprocess_rules": [],
+        },
+        full_text_html="""
+        <h2>Turbo heading</h2>
+        <p>Broken short turbo text.</p>
+        <figure><img src="https://example.com/body.jpg"/><figcaption>Body image</figcaption></figure>
+        """,
+        description_html="Lead text",
+        thumbnail_url=None,
+    )
+
+    assert result["content"] == (
+        "Full yandex paragraph with the beginning that is missing from broken turbo.\n"
+        "Second full yandex paragraph with enough context for production collection."
+    )
+    assert result["content_status"] == "ok"
+    assert result["extraction_method"] == "rss_yandex_fulltext"
+    assert result["extra"]["turbo_headings"] == ["Turbo heading"]
+    assert result["extra"]["inline_images"] == [
+        {"type": "image", "src": "https://example.com/body.jpg", "caption": "Body image"}
+    ]
