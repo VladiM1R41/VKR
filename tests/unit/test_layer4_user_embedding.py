@@ -28,6 +28,11 @@ class FakeVectorFetcher:
         return {point_id: self.vectors[point_id] for point_id in point_ids if point_id in self.vectors}
 
 
+class FailingVectorFetcher:
+    def fetch_dense_vectors(self, point_ids: list[str]) -> dict[str, list[float]]:
+        raise RuntimeError("qdrant is unavailable")
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.users = {
@@ -116,6 +121,17 @@ def test_rebuild_user_embedding_returns_not_updated_when_no_vectors() -> None:
 
     assert result.updated is False
     assert result.article_count == 0
+
+
+def test_rebuild_user_embedding_degrades_when_qdrant_unavailable() -> None:
+    session = FakeSession()
+    service = UserEmbeddingService(vector_fetcher=FailingVectorFetcher())  # type: ignore[arg-type]
+
+    result = service.rebuild_user_embedding(session, 1)
+
+    assert result.updated is False
+    assert result.article_count == 0
+    assert session.committed is False
 
 
 def test_rebuild_recent_user_embeddings_runs_for_active_users() -> None:

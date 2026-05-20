@@ -176,6 +176,7 @@ def test_digest_shortlist_can_be_persisted() -> None:
 
     assert digest.id == 10
     assert digest.content_text == "digest text"
+    assert digest.generated_at is not None
     assert session.flush_called is True
     assert session.committed is True
     assert len(session.added) == 3

@@ -34,3 +34,39 @@ def test_response_cache_round_trip() -> None:
 
     assert result == {"answer": "ok"}
 
+
+def test_response_cache_separates_prompt_model_provider_versions() -> None:
+    cache = ResponseCache()
+    fake = _FakeRedis()
+    cache._redis = fake
+
+    cache.set(
+        mode="factual",
+        rag_mode="standard",
+        query="Ставка ЦБ",
+        document_ids=[1],
+        prompt_version="v1",
+        provider_key="gigachat",
+        model_key="gigachat-max",
+        result={"answer": "old"},
+    )
+
+    assert cache.get(
+        mode="factual",
+        rag_mode="standard",
+        query="Ставка ЦБ",
+        document_ids=[1],
+        prompt_version="v1",
+        provider_key="gigachat",
+        model_key="gigachat-max",
+    ) == {"answer": "old"}
+
+    assert cache.get(
+        mode="factual",
+        rag_mode="standard",
+        query="Ставка ЦБ",
+        document_ids=[1],
+        prompt_version="v2",
+        provider_key="gigachat",
+        model_key="gigachat-max",
+    ) is None

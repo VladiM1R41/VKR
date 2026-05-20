@@ -126,4 +126,7 @@ def test_update_preferences_replaces_all_collections() -> None:
     assert user.settings == {
         "timezone": "Europe/Moscow",
         "digest_style": "brief",
+        "explicit_topic_ids": [1],
+        "explicit_entity_ids": [],
+        "explicit_source_ids": [5],
     }

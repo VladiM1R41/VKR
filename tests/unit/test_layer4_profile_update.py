@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from jarvis.db.models.news import News
 from jarvis.db.models.user import User
 from jarvis.db.models.user_entity_weight import UserEntityWeight
-from jarvis.db.models.user_source_preference import UserSourcePreference
 from jarvis.db.models.user_topic_weight import UserTopicWeight
 from jarvis.personalization.services.profile_update_service import (
     ProfileUpdateService,
@@ -64,7 +63,6 @@ class FakeSession:
         }
         self.topic_weights: dict[tuple[int, int], UserTopicWeight] = {}
         self.entity_weights: dict[tuple[int, int], UserEntityWeight] = {}
-        self.source_preferences: dict[tuple[int, int], UserSourcePreference] = {}
         self.topic_ids = [101, 102]
         self.entity_ids = [201]
         self.added = []
@@ -82,8 +80,6 @@ class FakeSession:
             return self.topic_weights.get((key["user_id"], key["topic_id"]))
         if name == "UserEntityWeight":
             return self.entity_weights.get((key["user_id"], key["entity_id"]))
-        if name == "UserSourcePreference":
-            return self.source_preferences.get((key["user_id"], key["source_id"]))
         return None
 
     def scalars(self, stmt):
@@ -100,8 +96,6 @@ class FakeSession:
             self.topic_weights[(obj.user_id, obj.topic_id)] = obj
         elif isinstance(obj, UserEntityWeight):
             self.entity_weights[(obj.user_id, obj.entity_id)] = obj
-        elif isinstance(obj, UserSourcePreference):
-            self.source_preferences[(obj.user_id, obj.source_id)] = obj
 
     def commit(self):
         self.committed = True
@@ -127,7 +121,6 @@ def test_update_from_interaction_updates_weights_and_session_profile() -> None:
     assert result.updated_entities == 1
     assert session.topic_weights[(1, 101)].weight == 0.625
     assert session.entity_weights[(1, 201)].weight == 0.625
-    assert session.source_preferences[(1, 5)].preference == "neutral"
     assert session.users[1].settings["source_affinity_scores"]["5"] == 0.625
     assert service.get_session_profile(1)["recent_news_ids"] == [2]
     assert service.get_session_profile(1)["recent_topic_ids"] == [102, 101]
@@ -135,7 +128,7 @@ def test_update_from_interaction_updates_weights_and_session_profile() -> None:
     assert session.committed is True
 
 
-def test_negative_signal_can_block_source() -> None:
+def test_negative_signal_updates_implicit_source_score_without_blocking_source() -> None:
     session = FakeSession()
     session.interactions[10].action = "dislike"
     session.users[1].settings = {"source_affinity_scores": {"5": 0.05}}
@@ -144,4 +137,24 @@ def test_negative_signal_can_block_source() -> None:
 
     service.update_from_interaction(session, 10)
 
-    assert session.source_preferences[(1, 5)].preference == "blocked"
+    assert session.users[1].settings["source_affinity_scores"]["5"] == 0.0375
+
+
+def test_update_from_interaction_does_not_overwrite_explicit_topic_or_entity_weights() -> None:
+    session = FakeSession()
+    session.users[1].settings = {
+        "explicit_topic_ids": [101],
+        "explicit_entity_ids": [201],
+    }
+    session.topic_weights[(1, 101)] = UserTopicWeight(user_id=1, topic_id=101, weight=0.9)
+    session.entity_weights[(1, 201)] = UserEntityWeight(user_id=1, entity_id=201, weight=0.9)
+    store = FakeSessionProfileStore()
+    service = ProfileUpdateService(session_store=store, alpha=0.25)
+
+    result = service.update_from_interaction(session, 10)
+
+    assert result.updated_topics == 1
+    assert result.updated_entities == 0
+    assert session.topic_weights[(1, 101)].weight == 0.9
+    assert session.topic_weights[(1, 102)].weight == 0.625
+    assert session.entity_weights[(1, 201)].weight == 0.9

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
+from pydantic import ValidationError
 
+from jarvis.core.settings import Settings
 from jarvis.generation.models.generation_models import (
     LLMGenerationRequest,
     LLMGenerationResponse,
@@ -19,7 +23,7 @@ from jarvis.generation.services.providers import (
     LLMTimeoutError,
     YandexGPTProvider,
 )
-from jarvis.generation.services.providers.factory import _make_provider
+from jarvis.generation.services.providers.factory import _make_provider, build_primary_provider
 from jarvis.generation.services.providers.http_provider import HTTPLLMProvider
 
 
@@ -64,9 +68,10 @@ class _FakeResponse:
 class _FakeAsyncClient:
     responses: list[object] = []
     calls: int = 0
+    init_kwargs: list[dict] = []
 
     def __init__(self, *args, **kwargs) -> None:
-        pass
+        type(self).init_kwargs.append(kwargs)
 
     async def __aenter__(self) -> "_FakeAsyncClient":
         return self
@@ -104,6 +109,145 @@ def test_factory_supports_expected_provider_names() -> None:
 def test_factory_rejects_unknown_provider() -> None:
     with pytest.raises(ValueError):
         _make_provider("unknown-provider")
+
+
+def test_factory_does_not_add_fake_fallback_in_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    import jarvis.generation.services.providers.factory as factory_module
+
+    monkeypatch.setattr(
+        factory_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            app_env="production",
+            jarvis_llm_provider="gigachat",
+            jarvis_llm_fallback_provider="",
+            jarvis_llm_model="gigachat-max",
+            jarvis_llm_timeout_sec=30.0,
+            jarvis_llm_retry_attempts=2,
+            jarvis_llm_max_input_tokens=20000,
+            jarvis_llm_max_output_tokens=1200,
+            jarvis_llm_temperature=0.2,
+            gigachat_base_url=None,
+            gigachat_api_key="token",
+            gigachat_auth_key=None,
+            gigachat_scope="GIGACHAT_API_PERS",
+            gigachat_tls_verify=True,
+            gigachat_ca_bundle=None,
+        ),
+    )
+
+    provider = build_primary_provider()
+
+    assert not isinstance(provider, FallbackLLMProvider)
+    assert provider.provider_name == "gigachat"
+
+
+def test_gigachat_uses_tls_verify_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    import jarvis.generation.services.providers.gigachat_provider as gigachat_module
+
+    monkeypatch.setattr(
+        gigachat_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            jarvis_llm_model="gigachat-max",
+            jarvis_llm_timeout_sec=30.0,
+            jarvis_llm_retry_attempts=2,
+            jarvis_llm_max_input_tokens=20000,
+            jarvis_llm_max_output_tokens=1200,
+            jarvis_llm_temperature=0.2,
+            gigachat_base_url=None,
+            gigachat_api_key="token",
+            gigachat_auth_key=None,
+            gigachat_scope="GIGACHAT_API_PERS",
+            gigachat_tls_verify=True,
+            gigachat_ca_bundle=None,
+        ),
+    )
+
+    provider = GigaChatProvider()
+
+    assert provider._tls_verify is True
+
+
+def test_gigachat_uses_ca_bundle_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    import jarvis.generation.services.providers.gigachat_provider as gigachat_module
+
+    monkeypatch.setattr(
+        gigachat_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            jarvis_llm_model="gigachat-max",
+            jarvis_llm_timeout_sec=30.0,
+            jarvis_llm_retry_attempts=2,
+            jarvis_llm_max_input_tokens=20000,
+            jarvis_llm_max_output_tokens=1200,
+            jarvis_llm_temperature=0.2,
+            gigachat_base_url=None,
+            gigachat_api_key="token",
+            gigachat_auth_key=None,
+            gigachat_scope="GIGACHAT_API_PERS",
+            gigachat_tls_verify=True,
+            gigachat_ca_bundle="C:/certs/sber-ca.pem",
+        ),
+    )
+
+    provider = GigaChatProvider()
+
+    assert provider._tls_verify == "C:/certs/sber-ca.pem"
+
+
+def test_settings_rejects_disabled_gigachat_tls_in_production() -> None:
+    with pytest.raises(ValidationError, match="GIGACHAT_TLS_VERIFY"):
+        Settings(APP_ENV="production", GIGACHAT_TLS_VERIFY=False)
+
+
+@pytest.mark.asyncio
+async def test_gigachat_http_client_receives_configured_tls_verify(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis.generation.services.providers.gigachat_provider as gigachat_module
+
+    monkeypatch.setattr(
+        gigachat_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            jarvis_llm_model="gigachat-max",
+            jarvis_llm_timeout_sec=30.0,
+            jarvis_llm_retry_attempts=0,
+            jarvis_llm_max_input_tokens=20000,
+            jarvis_llm_max_output_tokens=1200,
+            jarvis_llm_temperature=0.2,
+            gigachat_base_url=None,
+            gigachat_api_key="token",
+            gigachat_auth_key=None,
+            gigachat_scope="GIGACHAT_API_PERS",
+            gigachat_tls_verify=True,
+            gigachat_ca_bundle="C:/certs/sber-ca.pem",
+        ),
+    )
+    _FakeAsyncClient.calls = 0
+    _FakeAsyncClient.init_kwargs = []
+    _FakeAsyncClient.responses = [
+        _FakeResponse(
+            200,
+            {
+                "model": "gigachat-max",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+    ]
+    monkeypatch.setattr(gigachat_module.httpx, "AsyncClient", _FakeAsyncClient)
+
+    provider = GigaChatProvider()
+    response = await provider._post_with_retry(
+        url="https://gigachat.test/chat/completions",
+        payload={"messages": []},
+        headers={"Authorization": "Bearer token"},
+    )
+
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+    assert _FakeAsyncClient.init_kwargs[0]["verify"] == "C:/certs/sber-ca.pem"
 
 
 @pytest.mark.asyncio

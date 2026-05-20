@@ -101,6 +101,19 @@ def test_self_rag_uses_existing_relevant_context() -> None:
     assert result.answer.rag_mode == "self_rag"
 
 
+def test_self_rag_tokenizes_russian_words() -> None:
+    service = SelfRAGLightService()
+    items = [
+        _item(
+            news_id=1,
+            title="ЦБ повысил ставку",
+            content="Банк России сообщил о решении по ключевой ставке.",
+        )
+    ]
+
+    assert service.filter_relevant_documents("ставка ЦБ", items) == items
+
+
 def test_self_rag_triggers_retrieval_for_missing_relevance() -> None:
     answer_service = AnswerGenerationService(
         provider=_AsyncFakeProvider("Ответ после retrieval (ТАСС)."),

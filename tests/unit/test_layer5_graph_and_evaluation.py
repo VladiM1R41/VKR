@@ -5,6 +5,7 @@ from jarvis.generation.models.generation_models import (
     LLMGenerationResponse,
     ProviderConfig,
 )
+from jarvis.db.models import News, Source
 from jarvis.generation.services.answer_generation_service import (
     AnswerGenerationService,
     GenerationConfig,
@@ -85,6 +86,55 @@ def test_graph_rag_generate_uses_graph_mode(monkeypatch) -> None:
     )
 
     assert result.answer.rag_mode == "graph_rag"
+
+
+def test_graph_rag_related_context_uses_db_metadata() -> None:
+    service = GraphRAGLightService()
+    news = News(
+        id=100,
+        source_id=10,
+        title="ЦБ повысил ставку",
+        content="Банк России сообщил о решении.",
+        snippet_lead="Банк России сообщил.",
+        content_grade=2,
+        information_type="breaking",
+        urgency="high",
+        event_cluster_id=55,
+        extra={"trust_score": 0.1, "information_type": "reference", "urgency": "normal"},
+    )
+    source = Source(id=10, name="ТАСС", trust_score=0.87)
+
+    class _ScalarRows(list):
+        def all(self):
+            return list(self)
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def scalars(self, stmt):
+            self.calls += 1
+            if self.calls == 1:
+                return _ScalarRows([100])
+            if self.calls == 2:
+                return _ScalarRows([news])
+            if self.calls == 3:
+                return _ScalarRows([source])
+            return _ScalarRows([])
+
+    items = service.load_related_news_context(
+        _FakeSession(),
+        entity_ids=[1],
+        exclude_news_ids=set(),
+        limit=5,
+    )
+
+    assert len(items) == 1
+    assert items[0].source_name == "ТАСС"
+    assert items[0].trust_score == 0.87
+    assert items[0].information_type == "breaking"
+    assert items[0].urgency == "high"
+    assert items[0].event_cluster_id == 55
 
 
 def test_generation_evaluation_compare() -> None:

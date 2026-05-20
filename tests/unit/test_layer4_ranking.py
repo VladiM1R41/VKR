@@ -56,6 +56,7 @@ class FakeSession:
         ]
         self.topics = [type("Topic", (), {"id": 1, "name": "Экономика"})()]
         self.entities = [type("Entity", (), {"id": 10, "name": "ЦБ РФ"})()]
+        self.news_quality = [(1, 2, False), (2, 2, False), (3, 2, False)]
 
     def get(self, model, key):
         if model.__name__ == "User" and key == 1:
@@ -76,6 +77,12 @@ class FakeSession:
             return ScalarRows(self.topics)
         if "FROM entities" in text:
             return ScalarRows(self.entities)
+        raise AssertionError(text)
+
+    def execute(self, stmt):
+        text = str(stmt)
+        if "FROM news" in text:
+            return ScalarRows(self.news_quality)
         raise AssertionError(text)
 
 
@@ -181,3 +188,59 @@ def test_personalized_ranking_respects_blocked_source() -> None:
     ranked = ranking.rerank(session, 1, response)
     assert ranked.results[0].source_id == 100
     assert any(reason.startswith("blocked_source:") for reason in ranked.results[1].personalization_reasons)
+
+
+def test_personalized_ranking_does_not_overtake_strong_relevance_match() -> None:
+    session = FakeSession()
+    session.source_preferences = [
+        type("SourcePref", (), {"source_id": 100, "preference": "neutral"})(),
+        type("SourcePref", (), {"source_id": 300, "preference": "preferred"})(),
+    ]
+    ranking = PersonalizedRankingService(
+        seen_history=FakeSeenHistory(),
+        session_profile_store=FakeSessionStore(
+            {
+                "recent_news_ids": [],
+                "recent_topic_ids": [1],
+                "recent_entity_ids": [10],
+                "last_updated_at": datetime.now(UTC).isoformat(),
+            }
+        ),
+    )
+    response = SearchResponse(
+        query="точный запрос",
+        corrected_query=None,
+        intent="FACTUAL",
+        total=2,
+        search_time_ms=10.0,
+        results=[
+            SearchResult(
+                chunk_id="strong",
+                news_id=1,
+                source_id=100,
+                source_name="Нейтральный источник",
+                title="Сильный точный результат",
+                snippet="strong",
+                score=0.92,
+                topics=[],
+                entities=[],
+            ),
+            SearchResult(
+                chunk_id="personal",
+                news_id=3,
+                source_id=300,
+                source_name="Любимый источник",
+                title="Персонально похожий результат",
+                snippet="personal",
+                score=0.70,
+                topics=["Экономика"],
+                entities=["ЦБ РФ"],
+            ),
+        ],
+    )
+
+    ranked = ranking.rerank(session, 1, response)
+
+    assert ranked.results[0].news_id == 1
+    assert ranked.results[1].news_id == 3
+    assert ranked.results[1].personalized_score <= 0.82

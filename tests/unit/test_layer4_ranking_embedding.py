@@ -48,6 +48,11 @@ class FakeVectorFetcher:
         return {point_id: self.vectors[point_id] for point_id in point_ids if point_id in self.vectors}
 
 
+class FailingVectorFetcher:
+    def fetch_dense_vectors(self, point_ids: list[str]) -> dict[str, list[float]]:
+        raise RuntimeError("qdrant is unavailable")
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.user = User(id=1, username="alice", settings={}, created_at=datetime.now(UTC))
@@ -59,6 +64,7 @@ class FakeSession:
             (1, uuid.UUID("00000000-0000-0000-0000-000000000001"), "title"),
             (2, uuid.UUID("00000000-0000-0000-0000-000000000002"), "title"),
         ]
+        self.news_quality = [(1, 2, False), (2, 2, False)]
 
     def get(self, model, key):
         if model.__name__ == "User":
@@ -85,6 +91,8 @@ class FakeSession:
 
     def execute(self, stmt):
         text = str(stmt)
+        if "FROM news" in text:
+            return ScalarRows(self.news_quality)
         if "FROM chunks" in text:
             return ScalarRows(self.chunk_rows)
         raise AssertionError(text)
@@ -138,3 +146,48 @@ def test_personalized_ranking_uses_user_embedding_signal() -> None:
 
     assert ranked.results[0].news_id == 1
     assert "embedding_match" in ranked.results[0].personalization_reasons
+
+
+def test_personalized_ranking_degrades_without_article_vectors() -> None:
+    session = FakeSession()
+    ranking = PersonalizedRankingService(
+        seen_history=FakeSeenHistory(),
+        session_profile_store=FakeSessionStore(),
+        vector_fetcher=FailingVectorFetcher(),  # type: ignore[arg-type]
+    )
+    response = SearchResponse(
+        query="test",
+        corrected_query=None,
+        intent="FACTUAL",
+        total=2,
+        search_time_ms=10.0,
+        results=[
+            SearchResult(
+                chunk_id="a",
+                news_id=1,
+                source_id=300,
+                source_name="A",
+                title="A",
+                snippet="A",
+                score=0.71,
+                topics=[],
+                entities=[],
+            ),
+            SearchResult(
+                chunk_id="b",
+                news_id=2,
+                source_id=301,
+                source_name="B",
+                title="B",
+                snippet="B",
+                score=0.70,
+                topics=[],
+                entities=[],
+            ),
+        ],
+    )
+
+    ranked = ranking.rerank(session, 1, response)
+
+    assert [item.news_id for item in ranked.results] == [1, 2]
+    assert all("embedding_match" not in item.personalization_reasons for item in ranked.results)
