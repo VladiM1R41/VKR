@@ -20,7 +20,7 @@ class IngestionRun(Base):
     __tablename__ = "ingestion_runs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('running','success','partial','failed','timeout','skipped_304')",
+            "status IN ('running','success','partial','failed','timeout','skipped_304','skipped_backpressure')",
             name="ck_ingestion_runs_status",
         ),
         CheckConstraint(

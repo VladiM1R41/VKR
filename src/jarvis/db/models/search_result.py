@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Integer, text
+from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Integer, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from jarvis.db.base import Base
@@ -19,6 +19,7 @@ class SearchResult(Base):
             "rank_position IS NULL OR rank_position > 0",
             name="ck_search_results_rank_position",
         ),
+        UniqueConstraint("search_id", "news_id", name="uq_search_results_search_news"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -31,6 +32,7 @@ class SearchResult(Base):
         nullable=False,
     )
     rank_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    score: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0.0"))
     was_clicked: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     dwell_time_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=text("NOW()"))

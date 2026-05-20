@@ -16,7 +16,7 @@ class IngestionError(Base):
     __tablename__ = "ingestion_errors"
     __table_args__ = (
         CheckConstraint(
-            "error_type IN ('network','http_4xx','http_5xx','http_429','rss_parse','data_missing','date_parse','extraction','db_constraint','unknown')",
+            "error_type IN ('network','http_4xx','http_5xx','http_429','rss_parse','data_missing','date_parse','extraction','db_constraint','enqueue_failed','unknown')",
             name="ck_ingestion_errors_error_type",
         ),
     )

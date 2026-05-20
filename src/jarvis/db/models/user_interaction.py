@@ -16,7 +16,7 @@ class UserInteraction(Base):
     __tablename__ = "user_interactions"
     __table_args__ = (
         CheckConstraint(
-            "action IN ('click','read','like','dislike','save','hide','share')",
+            "action IN ('click','read','like','dislike','save','hide','share','read_long','click_short','skip')",
             name="ck_user_interactions_action",
         ),
     )
