@@ -64,6 +64,9 @@ _PROXY_VARS = [
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
     "GIT_HTTP_PROXY",
     "GIT_HTTPS_PROXY",
 ]
@@ -119,6 +122,9 @@ def _clear_bad_proxy_env() -> None:
         value = os.environ.get(key, "")
         if value.startswith("http://127.0.0.1:9"):
             os.environ.pop(key, None)
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("PROCESSING_EMBEDDING_BACKEND", "flagembedding")
 
 
 def _get_source(source_name: str) -> Source:

@@ -1,293 +1,535 @@
-"""Ablation study: Dense-only vs Sparse-only vs Hybrid (RRF) retrieval.
+"""Retrieval ablation study: dense-only vs sparse-only vs hybrid RRF.
 
-Запуск:
-    .venv/Scripts/python scripts/retrieval_ablation.py
+The script is intentionally outside the runtime API. It directly queries the
+existing Qdrant index in three modes and writes reproducible experiment tables.
 
-Результат: docs/retrieval_ablation.md + docs/retrieval_ablation.csv
+Run from repository root:
+    .\\.venv\\Scripts\\python.exe scripts\\run_with_layer_env.py -- .\\.venv\\Scripts\\python.exe scripts\\retrieval_ablation.py
+
+Outputs:
+    docs/experiments/retrieval_ablation_summary.csv
+    docs/experiments/retrieval_ablation_results.csv
+    docs/experiments/retrieval_ablation.md
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+from dataclasses import dataclass
+from datetime import UTC, datetime
+import json
+import math
+from pathlib import Path
+import statistics
 import sys
 import time
-from pathlib import Path
-from collections import Counter
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from jarvis.core.settings import get_settings
-get_settings.cache_clear()
-
-# ── Тестовые запросы ──────────────────────────────────────────────────────────
-
-QUERIES = [
-    "курс доллара рубль Банк России",        # лексически точный + именованные сущности
-    "санкции экономика последствия",          # семантически широкий
-    "искусственный интеллект технологии",    # тематический
-    "Путин политика Россия",                 # entity-heavy
-    "образование школа ученики",             # общая тема
-]
-
-MODES = ["dense_only", "sparse_only", "hybrid"]
+from typing import Any
 
 
-def encode_query(query: str):
-    """Получить dense + sparse векторы для запроса."""
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+
+MODES = ("dense_only", "sparse_only", "hybrid")
+MODE_LABELS = {
+    "dense_only": "Dense-only semantic search",
+    "sparse_only": "Sparse-only lexical search",
+    "hybrid": "Hybrid RRF dense+sparse",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class QueryCase:
+    """One evaluation query with lightweight relevance hints."""
+
+    query_id: str
+    query: str
+    relevant_terms: tuple[str, ...]
+    description: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievedItem:
+    """One raw Qdrant hit normalized for reporting."""
+
+    rank: int
+    point_id: str
+    news_id: int
+    score: float
+    source_name: str
+    title: str
+    text: str
+    url: str
+    topics: tuple[str, ...]
+    entities: tuple[str, ...]
+    keywords: tuple[str, ...]
+    published_at: str
+    relevance: int
+    matched_terms: tuple[str, ...]
+
+
+DEFAULT_QUERIES: tuple[QueryCase, ...] = (
+    QueryCase(
+        query_id="q01_trump",
+        query="Трамп",
+        relevant_terms=("трамп",),
+        description="Entity-heavy query; lexical channel should be strong.",
+    ),
+    QueryCase(
+        query_id="q02_bank_russia_rate",
+        query="ключевая ставка Банк России",
+        relevant_terms=("ставк", "банк россии", "центробанк", "цб"),
+        description="Exact economic terms and organization aliases.",
+    ),
+    QueryCase(
+        query_id="q03_ai",
+        query="искусственный интеллект технологии",
+        relevant_terms=("искусствен", "интеллект", "технолог", "ai"),
+        description="Broad semantic technology query.",
+    ),
+    QueryCase(
+        query_id="q04_sanctions",
+        query="санкции экономика последствия",
+        relevant_terms=("санкц", "эконом", "последств"),
+        description="Broad political/economic topic query.",
+    ),
+    QueryCase(
+        query_id="q05_mvd",
+        query="МВД расследование",
+        relevant_terms=("мвд", "расслед"),
+        description="Named entity plus event/action query.",
+    ),
+)
+
+
+def _load_queries(path: Path | None) -> tuple[QueryCase, ...]:
+    if path is None:
+        return DEFAULT_QUERIES
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    cases: list[QueryCase] = []
+    for index, item in enumerate(payload, start=1):
+        cases.append(
+            QueryCase(
+                query_id=str(item.get("query_id") or f"q{index:02d}"),
+                query=str(item["query"]),
+                relevant_terms=tuple(str(term).lower() for term in item.get("relevant_terms", [])),
+                description=str(item.get("description") or ""),
+            )
+        )
+    return tuple(cases)
+
+
+def _encode_query(query: str):
+    """Return dense and sparse vectors using the same runtime as Layers 2/3."""
     from jarvis.processing.ir.lemmatize import lemmatize_text
     from jarvis.processing.services.embedding_runtime import encode_texts
 
-    lemma = " ".join(lemmatize_text(query))
-    result = encode_texts([query], sparse_texts=[lemma])
-    dense = result["dense"][0].tolist()
-    sparse_raw = result.get("sparse", [{}])[0]  # dict {token_id: weight}
-    indices = list(sparse_raw.keys()) if sparse_raw else []
-    values = list(sparse_raw.values()) if sparse_raw else []
-    return dense, indices, values
+    lemma_text = lemmatize_text(query)
+    encoded = encode_texts([query], sparse_texts=[lemma_text])[0]
+    return encoded.dense_vector, encoded.sparse_indices, encoded.sparse_values
 
 
-def search_qdrant(
+def _query_qdrant(
+    *,
     dense_vector: list[float],
     sparse_indices: list[int],
     sparse_values: list[float],
     mode: str,
-    limit: int = 10,
-) -> tuple[list[dict], float]:
-    """Напрямую вызвать Qdrant в нужном режиме. Возвращает (results, latency_ms)."""
+    limit: int,
+) -> tuple[list[Any], float]:
+    """Run one direct Qdrant query mode and return raw points + latency."""
+    from jarvis.core.settings import get_settings
     from qdrant_client import QdrantClient, models
 
     settings = get_settings()
     client = QdrantClient(url=settings.qdrant_url)
-    collection = settings.qdrant_collection_alias
+    query_filter = models.Filter(
+        must=[
+            models.FieldCondition(key="language", match=models.MatchValue(value="ru")),
+        ]
+    )
 
-    # Фильтр: только русскоязычные
-    query_filter = models.Filter(must=[
-        models.FieldCondition(key="language", match=models.MatchValue(value="ru"))
-    ])
-
-    t0 = time.perf_counter()
-
+    start = time.perf_counter()
     if mode == "dense_only":
-        # Только плотный вектор — семантический поиск
-        results = client.query_points(
-            collection_name=collection,
+        response = client.query_points(
+            collection_name=settings.qdrant_collection_alias,
             query=dense_vector,
             using="dense",
             query_filter=query_filter,
             limit=limit,
             with_payload=True,
         )
-
     elif mode == "sparse_only":
-        # Только разреженный вектор — лексический поиск (TF-IDF)
-        if not sparse_indices:
+        if not sparse_indices or not sparse_values:
             return [], 0.0
-        results = client.query_points(
-            collection_name=collection,
+        response = client.query_points(
+            collection_name=settings.qdrant_collection_alias,
             query=models.SparseVector(indices=sparse_indices, values=sparse_values),
             using="sparse",
             query_filter=query_filter,
             limit=limit,
             with_payload=True,
         )
-
-    else:  # hybrid
-        # Оба вектора + RRF fusion
-        prefetches = [
+    elif mode == "hybrid":
+        prefetch = [
             models.Prefetch(query=dense_vector, using="dense", limit=limit),
         ]
-        if sparse_indices:
-            prefetches.append(
+        if sparse_indices and sparse_values:
+            prefetch.append(
                 models.Prefetch(
                     query=models.SparseVector(indices=sparse_indices, values=sparse_values),
                     using="sparse",
                     limit=limit,
                 )
             )
-        results = client.query_points(
-            collection_name=collection,
-            prefetch=prefetches,
+        response = client.query_points(
+            collection_name=settings.qdrant_collection_alias,
+            prefetch=prefetch,
             query=models.FusionQuery(fusion=models.Fusion.RRF),
             query_filter=query_filter,
             limit=limit,
             with_payload=True,
         )
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
 
-    latency_ms = (time.perf_counter() - t0) * 1000
-
-    rows = []
-    for point in results.points:
-        p = point.payload or {}
-        rows.append({
-            "score": round(point.score, 4),
-            "source_name": p.get("source_name", "?"),
-            "title": (p.get("title") or "")[:60],
-            "news_id": p.get("news_id"),
-        })
-    return rows, latency_ms
+    latency_ms = (time.perf_counter() - start) * 1000
+    return list(response.points), latency_ms
 
 
-def run_one(query: str, mode: str) -> dict:
-    """Прогнать один запрос в одном режиме."""
-    try:
-        dense, sparse_idx, sparse_val = encode_query(query)
-    except Exception as exc:
-        return {"query": query[:40], "mode": mode, "error": str(exc),
-                "latency_ms": 0, "results": 0, "sources": "", "top_source": "ERROR", "avg_score": 0.0}
+def _normalize_text(value: object) -> str:
+    return str(value or "").lower().replace("ё", "е")
 
-    try:
-        results, latency_ms = search_qdrant(dense, sparse_idx, sparse_val, mode)
-    except Exception as exc:
-        return {"query": query[:40], "mode": mode, "error": str(exc),
-                "latency_ms": 0, "results": 0, "sources": "", "top_source": "ERROR", "avg_score": 0.0}
 
-    if not results:
-        return {"query": query[:40], "mode": mode, "error": "no_results",
-                "latency_ms": int(latency_ms), "results": 0, "sources": "", "top_source": "—", "avg_score": 0.0}
+def _score_relevance(payload: dict[str, Any], relevant_terms: tuple[str, ...]) -> tuple[int, tuple[str, ...]]:
+    """Lightweight automatic relevance label for early experiments.
 
-    source_counter = Counter(r["source_name"] for r in results)
-    unique_sources = len(source_counter)
-    top_source = source_counter.most_common(1)[0][0]
-    sources_list = ", ".join(s for s, _ in source_counter.most_common(3))
-    avg_score = round(sum(r["score"] for r in results) / len(results), 4)
+    2 = expected term/entity appears in title, entities, topics or keywords.
+    1 = expected term appears only in chunk/article text.
+    0 = no expected term found.
+    """
+    if not relevant_terms:
+        return 0, ()
 
-    return {
-        "query": query[:40] + ("..." if len(query) > 40 else ""),
-        "mode": mode,
-        "error": "",
-        "latency_ms": int(latency_ms),
-        "results": len(results),
-        "unique_sources": unique_sources,
-        "top_source": top_source,
-        "sources_top3": sources_list,
-        "avg_score": avg_score,
-        "top3_titles": " | ".join(r["title"] for r in results[:3]),
-    }
+    title = _normalize_text(payload.get("title") or payload.get("snippet_lead"))
+    strong_fields = " ".join(
+        [
+            title,
+            _normalize_text(" ".join(payload.get("entities") or [])),
+            _normalize_text(" ".join(payload.get("topics") or [])),
+            _normalize_text(" ".join(payload.get("keywords") or [])),
+        ]
+    )
+    weak_fields = " ".join(
+        [
+            strong_fields,
+            _normalize_text(payload.get("text") or payload.get("text_content")),
+            _normalize_text(payload.get("lemma_text")),
+        ]
+    )
+
+    matched_strong = tuple(term for term in relevant_terms if _normalize_text(term) in strong_fields)
+    if matched_strong:
+        return 2, matched_strong
+
+    matched_weak = tuple(term for term in relevant_terms if _normalize_text(term) in weak_fields)
+    if matched_weak:
+        return 1, matched_weak
+
+    return 0, ()
+
+
+def _normalize_hit(rank: int, point: Any, case: QueryCase) -> RetrievedItem:
+    payload = point.payload or {}
+    relevance, matched_terms = _score_relevance(payload, case.relevant_terms)
+    return RetrievedItem(
+        rank=rank,
+        point_id=str(point.id),
+        news_id=int(payload.get("news_id") or 0),
+        score=round(float(point.score or 0.0), 6),
+        source_name=str(payload.get("source_name") or ""),
+        title=str(payload.get("title") or payload.get("snippet_lead") or ""),
+        text=str(payload.get("text") or payload.get("text_content") or ""),
+        url=str(payload.get("url") or ""),
+        topics=tuple(str(item) for item in payload.get("topics") or []),
+        entities=tuple(str(item) for item in payload.get("entities") or []),
+        keywords=tuple(str(item) for item in payload.get("keywords") or []),
+        published_at=str(payload.get("published_at") or ""),
+        relevance=relevance,
+        matched_terms=matched_terms,
+    )
+
+
+def _precision_at(items: list[RetrievedItem], k: int) -> float:
+    window = items[:k]
+    if not window:
+        return 0.0
+    return sum(1 for item in window if item.relevance > 0) / len(window)
+
+
+def _mrr(items: list[RetrievedItem]) -> float:
+    for item in items:
+        if item.relevance > 0:
+            return 1.0 / item.rank
+    return 0.0
+
+
+def _dcg(relevances: list[int]) -> float:
+    return sum((2**rel - 1) / math.log2(index + 2) for index, rel in enumerate(relevances))
+
+
+def _ndcg_at(items: list[RetrievedItem], k: int) -> float:
+    relevances = [item.relevance for item in items[:k]]
+    if not relevances:
+        return 0.0
+    ideal = sorted(relevances, reverse=True)
+    ideal_dcg = _dcg(ideal)
+    if ideal_dcg == 0:
+        return 0.0
+    return _dcg(relevances) / ideal_dcg
+
+
+def _source_diversity(items: list[RetrievedItem], k: int) -> int:
+    return len({item.source_name for item in items[:k] if item.source_name})
+
+
+def _run_case(case: QueryCase, *, limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    dense_vector, sparse_indices, sparse_values = _encode_query(case.query)
+    result_rows: list[dict[str, Any]] = []
+    summary_rows: list[dict[str, Any]] = []
+
+    for mode in MODES:
+        points, latency_ms = _query_qdrant(
+            dense_vector=dense_vector,
+            sparse_indices=sparse_indices,
+            sparse_values=sparse_values,
+            mode=mode,
+            limit=limit,
+        )
+        items = [_normalize_hit(rank, point, case) for rank, point in enumerate(points, start=1)]
+        summary_rows.append(
+            {
+                "query_id": case.query_id,
+                "query": case.query,
+                "mode": mode,
+                "mode_label": MODE_LABELS[mode],
+                "latency_ms": round(latency_ms, 1),
+                "results": len(items),
+                "precision_at_5": round(_precision_at(items, 5), 4),
+                "precision_at_10": round(_precision_at(items, 10), 4),
+                "mrr": round(_mrr(items), 4),
+                "ndcg_at_10": round(_ndcg_at(items, 10), 4),
+                "source_diversity_at_10": _source_diversity(items, 10),
+                "top1_news_id": items[0].news_id if items else None,
+                "top1_title": items[0].title if items else "",
+                "top1_relevance": items[0].relevance if items else 0,
+                "error": "",
+            }
+        )
+
+        for item in items:
+            result_rows.append(
+                {
+                    "query_id": case.query_id,
+                    "query": case.query,
+                    "mode": mode,
+                    "rank": item.rank,
+                    "news_id": item.news_id,
+                    "point_id": item.point_id,
+                    "score": item.score,
+                    "auto_relevance": item.relevance,
+                    "matched_terms": ", ".join(item.matched_terms),
+                    "source_name": item.source_name,
+                    "title": item.title,
+                    "url": item.url,
+                    "topics": ", ".join(item.topics),
+                    "entities": ", ".join(item.entities[:8]),
+                    "published_at": item.published_at,
+                }
+            )
+
+    return summary_rows, result_rows
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _mean(rows: list[dict[str, Any]], mode: str, key: str) -> float:
+    values = [float(row[key]) for row in rows if row["mode"] == mode and row.get("error", "") == ""]
+    return round(statistics.mean(values), 4) if values else 0.0
+
+
+def _build_markdown(
+    *,
+    cases: tuple[QueryCase, ...],
+    summary_rows: list[dict[str, Any]],
+    result_rows: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "# Retrieval ablation: dense-only vs sparse-only vs hybrid",
+        "",
+        f"Дата запуска: {datetime.now(UTC).isoformat(timespec='seconds')}",
+        "",
+        "Эксперимент сравнивает только первый этап поиска по индексу Qdrant. Переранжирование кросс-кодером,",
+        "персонализация и кэш здесь намеренно отключены, чтобы изолировать вклад retrieval-каналов.",
+        "",
+        "Автоматическая релевантность является предварительной эвристикой:",
+        "",
+        "- `2`: ожидаемый термин найден в заголовке, сущностях, темах или ключевых словах;",
+        "- `1`: ожидаемый термин найден только в тексте фрагмента;",
+        "- `0`: ожидаемый термин не найден.",
+        "",
+        "Для итоговой дипломной оценки этот CSV удобно дополнить ручной экспертной разметкой `0/1/2` и пересчитать nDCG.",
+        "",
+        "## Aggregate metrics",
+        "",
+        "| Mode | Mean latency, ms | P@5 | P@10 | MRR | nDCG@10 | Source diversity@10 |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for mode in MODES:
+        lines.append(
+            "| "
+            f"{MODE_LABELS[mode]} | "
+            f"{_mean(summary_rows, mode, 'latency_ms')} | "
+            f"{_mean(summary_rows, mode, 'precision_at_5')} | "
+            f"{_mean(summary_rows, mode, 'precision_at_10')} | "
+            f"{_mean(summary_rows, mode, 'mrr')} | "
+            f"{_mean(summary_rows, mode, 'ndcg_at_10')} | "
+            f"{_mean(summary_rows, mode, 'source_diversity_at_10')} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Query-level metrics",
+            "",
+            "| Query | Mode | P@5 | MRR | nDCG@10 | Top-1 relevance | Top-1 title |",
+            "|---|---|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in summary_rows:
+        lines.append(
+            "| "
+            f"{row['query']} | {row['mode']} | {row['precision_at_5']} | {row['mrr']} | "
+            f"{row['ndcg_at_10']} | {row['top1_relevance']} | {str(row['top1_title'])[:90]} |"
+        )
+
+    lines.extend(["", "## Query set", ""])
+    for case in cases:
+        lines.append(
+            f"- `{case.query_id}`: {case.query}. Terms: {', '.join(case.relevant_terms)}. {case.description}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Sample top results",
+            "",
+            "| Query | Mode | Rank | Relevance | Source | Title |",
+            "|---|---|---:|---:|---|---|",
+        ]
+    )
+    for row in result_rows:
+        if int(row["rank"]) > 3:
+            continue
+        lines.append(
+            "| "
+            f"{row['query']} | {row['mode']} | {row['rank']} | {row['auto_relevance']} | "
+            f"{row['source_name']} | {str(row['title'])[:110]} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Interpretation hints",
+            "",
+            "- Dense-only обычно лучше ловит смысловые связи, но может приводить тематически близкие, но лексически неточные документы.",
+            "- Sparse-only обычно сильнее на именах, организациях, числах и точных формулировках.",
+            "- Hybrid RRF должен давать более устойчивый результат, потому что объединяет оба сигнала без приведения score к одной шкале.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def main() -> None:
-    all_rows: list[dict] = []
-    total = len(QUERIES) * len(MODES)
-    done = 0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--queries", type=Path, default=None, help="Optional JSON query set.")
+    parser.add_argument("--limit", type=int, default=10, help="Top-K per query/mode.")
+    parser.add_argument("--out-dir", type=Path, default=ROOT / "docs" / "experiments")
+    args = parser.parse_args()
 
-    print(f"Retrieval Ablation: {len(QUERIES)} zaprosov x {len(MODES)} rezhima = {total}")
-    print("=" * 65)
+    cases = _load_queries(args.queries)
+    summary_rows: list[dict[str, Any]] = []
+    result_rows: list[dict[str, Any]] = []
 
-    # Преднагреваем модель одним запросом
-    print("Загрузка embedding-модели...", flush=True)
-    try:
-        encode_query("тест")
-        print("Модель загружена.", flush=True)
-    except Exception as e:
-        print(f"Ошибка загрузки модели: {e}")
-        return
+    print(f"Retrieval ablation: {len(cases)} queries x {len(MODES)} modes, limit={args.limit}", flush=True)
+    print("Loading embedding backend on first query may take time, but offline cache should be used.", flush=True)
 
-    for query in QUERIES:
-        print(f"\nЗапрос: {query[:55]}")
-        for mode in MODES:
-            done += 1
-            row = run_one(query, mode)
-            all_rows.append(row)
-            src = row.get("sources_top3", row.get("top_source", "?"))
-            print(f"  [{done:2d}/{total}] {mode:<12} | {row['latency_ms']:5d}ms "
-                  f"| {row.get('unique_sources', 0)} источн. "
-                  f"| avg_score={row.get('avg_score', 0):.3f} "
-                  f"| {src}", flush=True)
-
-    # ── CSV ───────────────────────────────────────────────────────────────────
-    out_dir = Path(__file__).parent.parent / "docs"
-    out_dir.mkdir(exist_ok=True)
-
-    csv_path = out_dir / "retrieval_ablation.csv"
-    fields = ["query", "mode", "latency_ms", "results", "unique_sources",
-              "top_source", "sources_top3", "avg_score", "top3_titles", "error"]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(all_rows)
-    print(f"\nCSV: {csv_path}")
-
-    # ── Сводная таблица по режимам ────────────────────────────────────────────
-    from collections import defaultdict
-    stats: dict[str, dict] = defaultdict(lambda: {
-        "lat_sum": 0, "src_sum": 0, "score_sum": 0.0, "res_sum": 0, "n": 0
-    })
-    for r in all_rows:
-        if r.get("error"):
+    for case_index, case in enumerate(cases, start=1):
+        print(f"\n[{case_index}/{len(cases)}] {case.query}", flush=True)
+        try:
+            case_summary, case_results = _run_case(case, limit=args.limit)
+        except Exception as exc:
+            print(f"  ERROR: {exc}", flush=True)
+            for mode in MODES:
+                summary_rows.append(
+                    {
+                        "query_id": case.query_id,
+                        "query": case.query,
+                        "mode": mode,
+                        "mode_label": MODE_LABELS[mode],
+                        "latency_ms": 0,
+                        "results": 0,
+                        "precision_at_5": 0,
+                        "precision_at_10": 0,
+                        "mrr": 0,
+                        "ndcg_at_10": 0,
+                        "source_diversity_at_10": 0,
+                        "top1_news_id": None,
+                        "top1_title": "",
+                        "top1_relevance": 0,
+                        "error": str(exc),
+                    }
+                )
             continue
-        s = stats[r["mode"]]
-        s["lat_sum"] += r["latency_ms"]
-        s["src_sum"] += r.get("unique_sources", 0)
-        s["score_sum"] += r.get("avg_score", 0.0)
-        s["res_sum"] += r.get("results", 0)
-        s["n"] += 1
 
-    # ── Markdown ──────────────────────────────────────────────────────────────
-    mode_label = {"dense_only": "Dense-only (семантический)", "sparse_only": "Sparse-only (лексический)", "hybrid": "Hybrid RRF (dense + sparse)"}
+        summary_rows.extend(case_summary)
+        result_rows.extend(case_results)
+        for row in case_summary:
+            print(
+                "  "
+                f"{row['mode']:<12} latency={row['latency_ms']:>7}ms "
+                f"P@5={row['precision_at_5']:.2f} "
+                f"MRR={row['mrr']:.2f} "
+                f"nDCG@10={row['ndcg_at_10']:.2f}",
+                flush=True,
+            )
 
-    lines = [
-        "# Ablation Study: Retrieval-режимы",
-        "",
-        "**Сравнение:** Dense-only (BGE-M3) vs Sparse-only (TF-IDF) vs Hybrid RRF",
-        f"**Запросов:** {len(QUERIES)}  **Режимов:** {len(MODES)}",
-        "",
-        "## Сводная таблица",
-        "",
-        "| Режим | Ср. задержка (мс) | Ср. уникальных источников | Ср. score | Ср. найдено |",
-        "|-------|------------------|--------------------------|-----------|-------------|",
-    ]
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = args.out_dir / "retrieval_ablation_summary.csv"
+    results_path = args.out_dir / "retrieval_ablation_results.csv"
+    report_path = args.out_dir / "retrieval_ablation.md"
+    _write_csv(summary_path, summary_rows)
+    _write_csv(results_path, result_rows)
+    report_path.write_text(
+        _build_markdown(cases=cases, summary_rows=summary_rows, result_rows=result_rows),
+        encoding="utf-8",
+    )
 
-    for mode in MODES:
-        s = stats[mode]
-        n = s["n"] or 1
-        lines.append(
-            f"| {mode_label.get(mode, mode)} "
-            f"| {s['lat_sum']//n} "
-            f"| {round(s['src_sum']/n, 1)} "
-            f"| {round(s['score_sum']/n, 3)} "
-            f"| {round(s['res_sum']/n, 1)} |"
-        )
-
-    lines += ["", "## Детальные результаты", "",
-              "| Запрос | Режим | Задержка | Источников | Топ источники | avg_score |",
-              "|--------|-------|----------|-----------|---------------|-----------|"]
-
-    for r in all_rows:
-        lines.append(
-            f"| {r['query']} | {r['mode']} | {r['latency_ms']}ms "
-            f"| {r.get('unique_sources','?')} | {r.get('sources_top3', r.get('error','?'))} "
-            f"| {r.get('avg_score', 0):.3f} |"
-        )
-
-    lines += [
-        "",
-        "## Выводы",
-        "",
-        "- **Dense-only**: находит семантически близкие документы, хорошо для широких тематических запросов.",
-        "- **Sparse-only**: точный лексический поиск, хорошо для запросов с именованными сущностями и точными терминами.",
-        "- **Hybrid RRF**: объединяет оба сигнала через RRF, как правило даёт большее разнообразие источников.",
-        "",
-        "*Sparse = TF-IDF приближение через хэши токенов (не нативный BGE-M3 sparse, т.к. Python 3.12)*",
-        "*Dense = BAAI/bge-m3, 1024-dim, cosine similarity*",
-        "*Hybrid = Qdrant Query API с двумя Prefetch + FusionQuery(RRF)*",
-    ]
-
-    md_path = out_dir / "retrieval_ablation.md"
-    md_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"Markdown: {md_path}")
-
-    print("\n" + "=" * 65)
-    print("ИТОГ:")
-    print(f"{'Режим':<28} {'Задержка':>10} {'Источников':>12} {'avg_score':>10}")
-    print("-" * 65)
-    for mode in MODES:
-        s = stats[mode]
-        n = s["n"] or 1
-        print(f"{mode_label.get(mode, mode):<28} "
-              f"{s['lat_sum']//n:>8}ms "
-              f"{round(s['src_sum']/n,1):>11} "
-              f"{round(s['score_sum']/n,3):>10}")
-    print("=" * 65)
+    print("\nWritten:")
+    print(f"  {summary_path}")
+    print(f"  {results_path}")
+    print(f"  {report_path}")
 
 
 if __name__ == "__main__":
