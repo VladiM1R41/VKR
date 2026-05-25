@@ -15,6 +15,11 @@ from jarvis.db.session import SyncSessionLocal
 
 logger = logging.getLogger(__name__)
 
+_ASCENDING_RATIO = 1.25
+_DESCENDING_RATIO = 0.75
+_MIN_ASCENDING_CURRENT_MENTIONS = 3.0
+_MIN_ASCENDING_SOURCE_DIVERSITY = 2
+
 
 @dataclass(frozen=True, slots=True)
 class EntityProfilesUpdateResult:
@@ -25,15 +30,23 @@ class EntityProfilesUpdateResult:
     total_profiles: int
 
 
-def _trend_direction(current: float, baseline: float) -> str:
+def _trend_direction(current: float, baseline: float, *, source_diversity: int = 0) -> str:
+    """Classify trend direction with guards against one-off entity spikes."""
+
     if baseline <= 0 and current > 0:
-        return "ascending"
+        if current >= _MIN_ASCENDING_CURRENT_MENTIONS and source_diversity >= _MIN_ASCENDING_SOURCE_DIVERSITY:
+            return "ascending"
+        return "stable"
     if baseline <= 0:
         return "stable"
     ratio = current / baseline
-    if ratio >= 1.25:
+    if (
+        ratio >= _ASCENDING_RATIO
+        and current >= _MIN_ASCENDING_CURRENT_MENTIONS
+        and source_diversity >= _MIN_ASCENDING_SOURCE_DIVERSITY
+    ):
         return "ascending"
-    if ratio <= 0.75:
+    if ratio <= _DESCENDING_RATIO:
         return "descending"
     return "stable"
 
@@ -104,7 +117,11 @@ def update_entity_profiles() -> EntityProfilesUpdateResult:
             profile.mention_freq_current = current_mentions
             profile.mention_freq_baseline = round(baseline_daily, 4)
             profile.source_diversity = source_diversity
-            profile.trend_direction = _trend_direction(current_mentions, baseline_daily)
+            profile.trend_direction = _trend_direction(
+                current_mentions,
+                baseline_daily,
+                source_diversity=source_diversity,
+            )
             profile.last_updated = now
 
         session.commit()

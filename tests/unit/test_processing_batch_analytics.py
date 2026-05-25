@@ -8,6 +8,8 @@ from jarvis.processing.services.batch_analytics import (
     _MIN_TERM_FREQUENCY,
     _MIN_BIGRAM_FREQUENCY,
     _count_term_frequencies,
+    _filter_bigrams,
+    _filter_unigrams,
 )
 
 
@@ -76,6 +78,11 @@ class TestVocabularyUpdate:
         assert doc_counter["gas"] == 1
         assert collection_counter["gas"] == 1
 
+    def test_filters_stopwords_and_code_terms(self):
+        terms = _filter_unigrams(["россия", "что", "на", "skip", "x-forwarded-for", "трамп", "руб"])
+
+        assert terms == ["россия", "трамп", "руб"]
+
 
 class TestCollocationUpdate:
     """Тесты обновления коллокаций (unit, без БД)."""
@@ -95,3 +102,20 @@ class TestCollocationUpdate:
         pmi = log(p_joint / (p_a * p_b))
         # PMI ≈ log(0.05 / 0.0042) ≈ log(11.9) ≈ 2.48
         assert pmi > 2.0  # сильная ассоциация
+
+
+class TestCollocationQualityFilters:
+    def test_filters_noisy_collocations_but_keeps_news_phrases(self):
+        bigrams = _filter_bigrams(
+            [
+                ("дональд", "трамп"),
+                ("млрд", "руб"),
+                ("skip", "locked"),
+                ("usr", "bin"),
+                ("diannas", "dontbuild"),
+                ("что", "заявить"),
+                ("x-forwarded-for", "proxy_add_x_forwarded_for"),
+            ]
+        )
+
+        assert bigrams == [("дональд", "трамп"), ("млрд", "руб")]

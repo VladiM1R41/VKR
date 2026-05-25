@@ -303,6 +303,42 @@ def test_query_expansion_skips_short_ambiguous_terms(monkeypatch) -> None:
     assert expand_query_with_collocations("конституционный суд пенсия") == []
 
 
+def test_query_expansion_filters_code_like_noise(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "jarvis.retrieval.services.query_expansion._load_collocations",
+        lambda: [
+            ("skip", "locked", 12.0, 20),
+            ("usr", "bin", 12.0, 20),
+            ("diannas", "dontbuild", 12.0, 20),
+            ("x-forwarded-for", "proxy_add_x_forwarded_for", 12.0, 20),
+            ("дональд", "трамп", 6.5, 800),
+        ],
+    )
+
+    assert expand_query_with_collocations("трамп") == ["дональд трамп"]
+
+
+def test_query_expansion_allows_known_short_domain_terms(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "jarvis.retrieval.services.query_expansion._load_collocations",
+        lambda: [("млрд", "руб", 6.0, 100)],
+    )
+
+    assert expand_query_with_collocations("руб") == ["млрд руб"]
+
+
+def test_query_expansion_skips_when_query_already_contains_known_phrase(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "jarvis.retrieval.services.query_expansion._load_collocations",
+        lambda: [
+            ("искусственный", "интеллект", 8.0, 300),
+            ("технология", "искусственный", 7.0, 100),
+        ],
+    )
+
+    assert expand_query_with_collocations("искусственный интеллект") == []
+
+
 def test_rate_limiter_uses_atomic_lua_eval(monkeypatch) -> None:
     class FakeRedis:
         def __init__(self):

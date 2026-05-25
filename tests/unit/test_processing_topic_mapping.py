@@ -31,6 +31,27 @@ def test_lexical_topics_cover_uncategorized_finance_text() -> None:
     assert "Технологии" not in names
 
 
+def test_lexical_topics_cover_security_news_without_categories() -> None:
+    matches = classify_topics_lexical(
+        title="В ЛНР пострадавших после удара ВСУ эвакуировали в Москву",
+        body="После атаки БПЛА по общежитию колледжа несколько человек остаются в больницах.",
+    )
+    names = {match.name for match in matches}
+
+    assert "Безопасность" in names
+
+
+def test_short_markers_do_not_match_inside_unrelated_words() -> None:
+    matches = classify_topics_lexical(
+        title="Российский танк сорвал ротацию ВСУ в Сумской области",
+        body="Операторы БПЛА обнаружили позиции противника.",
+    )
+    names = {match.name for match in matches}
+
+    assert "Безопасность" in names
+    assert "Транспорт" not in names
+
+
 def test_resolve_topics_keeps_rule_based_unchanged_without_zero_shot(monkeypatch) -> None:
     def fail_zero_shot(text: str):
         raise AssertionError("zero-shot should not be called when lexical or rule topics exist")

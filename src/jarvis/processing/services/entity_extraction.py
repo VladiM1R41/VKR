@@ -28,6 +28,45 @@ _ENTITY_ALIASES: dict[tuple[str, str], tuple[str, str]] = {
     ("Совфед", "organization"): ("Совет Федерации", "Совет Федерации"),
 }
 
+_COMMON_ENTITY_ALIASES: dict[tuple[str, str], tuple[str, str]] = {
+    ("рф", "location"): ("Россия", "Россия"),
+    ("россия", "location"): ("Россия", "Россия"),
+    ("россии", "location"): ("Россия", "Россия"),
+    ("россией", "location"): ("Россия", "Россия"),
+    ("россию", "location"): ("Россия", "Россия"),
+    ("сша", "location"): ("США", "США"),
+    ("соединенные штаты", "location"): ("США", "США"),
+    ("соединенные штаты америки", "location"): ("США", "США"),
+    ("украина", "location"): ("Украина", "Украина"),
+    ("украины", "location"): ("Украина", "Украина"),
+    ("украине", "location"): ("Украина", "Украина"),
+    ("украиной", "location"): ("Украина", "Украина"),
+    ("иран", "location"): ("Иран", "Иран"),
+    ("ирана", "location"): ("Иран", "Иран"),
+    ("ираном", "location"): ("Иран", "Иран"),
+    ("израиль", "location"): ("Израиль", "Израиль"),
+    ("израиля", "location"): ("Израиль", "Израиль"),
+    ("израилем", "location"): ("Израиль", "Израиль"),
+    ("палестина", "location"): ("Палестина", "Палестина"),
+    ("палестины", "location"): ("Палестина", "Палестина"),
+    ("палестине", "location"): ("Палестина", "Палестина"),
+    ("москва", "location"): ("Москва", "Москва"),
+    ("москвы", "location"): ("Москва", "Москва"),
+    ("москве", "location"): ("Москва", "Москва"),
+    ("москвой", "location"): ("Москва", "Москва"),
+    ("трамп", "person"): ("Дональд Трамп", "Дональд Трамп"),
+    ("трампа", "person"): ("Дональд Трамп", "Дональд Трамп"),
+    ("дональд трамп", "person"): ("Дональд Трамп", "Дональд Трамп"),
+    ("путин", "person"): ("Владимир Путин", "Владимир Путин"),
+    ("путина", "person"): ("Владимир Путин", "Владимир Путин"),
+    ("владимир путин", "person"): ("Владимир Путин", "Владимир Путин"),
+    ("макрон", "person"): ("Эммануэль Макрон", "Эммануэль Макрон"),
+    ("макрона", "person"): ("Эммануэль Макрон", "Эммануэль Макрон"),
+    ("эммануэль макрон", "person"): ("Эммануэль Макрон", "Эммануэль Макрон"),
+    ("лукашенко", "person"): ("Александр Лукашенко", "Александр Лукашенко"),
+    ("александр лукашенко", "person"): ("Александр Лукашенко", "Александр Лукашенко"),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class ExtractedEntity:
@@ -82,6 +121,12 @@ def _apply_entity_alias(
     canonical = _ENTITY_ALIASES.get((cleaned_normal, entity_type)) or _ENTITY_ALIASES.get(
         (cleaned_display, entity_type)
     )
+    if canonical is None:
+        normalized_key = cleaned_normal.lower().replace("ё", "е")
+        display_key = cleaned_display.lower().replace("ё", "е")
+        canonical = _COMMON_ENTITY_ALIASES.get((normalized_key, entity_type)) or _COMMON_ENTITY_ALIASES.get(
+            (display_key, entity_type)
+        )
     if canonical is None:
         return cleaned_display, cleaned_normal, entity_type
 
