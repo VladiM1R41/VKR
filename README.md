@@ -163,6 +163,22 @@ Check local runtime status and queues:
 powershell -ExecutionPolicy Bypass -File .\scripts\celery_runtime_status.ps1
 ```
 
+Open the optional Celery Flower web UI:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_celery_flower.ps1
+```
+
+Or start Flower together with the local runtime:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start_celery_runtime.ps1 -WithFlower
+```
+
+Then open `http://127.0.0.1:5555`. Flower is only a monitoring UI: it does
+not start collection, processing or Beat by itself. Use it together with the
+local runtime to inspect workers, active tasks, completed tasks and failures.
+
 Stop local runtime:
 
 ```powershell

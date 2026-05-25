@@ -26,6 +26,7 @@ alembic==1.13.3
 # === Queue / Cache ===
 celery[redis]==5.4.0
 redis==5.0.8
+flower==2.0.1
 
 # === Layer 2: Vector DB ===
 qdrant-client==1.12.2

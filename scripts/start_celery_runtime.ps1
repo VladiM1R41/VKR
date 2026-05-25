@@ -5,7 +5,10 @@ param(
     [switch]$NoEnrichment,
     [switch]$NoProcessing,
     [switch]$NoAnalytics,
-    [switch]$SkipHealthCheck
+    [switch]$SkipHealthCheck,
+    [switch]$WithFlower,
+    [int]$FlowerPort = 5555,
+    [string]$FlowerAddress = "127.0.0.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -183,6 +186,14 @@ if (-not $NoBeat) {
         "-A", "jarvis.ingestion.tasks.celery_app",
         "beat", "-l", "info", "--schedule", ".tmp\celery_runtime\celerybeat-schedule"
     )
+}
+
+if ($WithFlower) {
+    Start-CeleryProcess "celery-flower" @(
+        "-A", "jarvis.ingestion.tasks.celery_app",
+        "flower", "--address=$FlowerAddress", "--port=$FlowerPort"
+    )
+    Write-Host "Flower UI: http://$FlowerAddress`:$FlowerPort" -ForegroundColor Cyan
 }
 
 Write-Host ""
