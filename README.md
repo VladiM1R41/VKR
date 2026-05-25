@@ -58,6 +58,9 @@ Key variables:
 | `SOURCE_LOCK_TTL_SECONDS` | Redis lock TTL, must stay strictly above budget; recommended `600` for budget `300` |
 | `SCHEDULER_TICK_SECONDS` | Celery Beat dispatch interval |
 | `CRAWL_JITTER_RATIO` | Stable scheduler jitter ratio |
+| `PROCESSING_BATCH_SIZE`, `PROCESSING_TICK_SECONDS`, `PROCESSING_LOCK_TTL_SECONDS` | Layer 2 processing worker cadence and lock settings |
+| `PROCESSING_EMBEDDING_BACKEND` | Embedding backend for Layer 2 processing |
+| `CELERY_ENABLE_LAYER4_SCHEDULE` | Enables optional Layer 4 personalization Beat jobs when `true` |
 
 ## Install
 
@@ -111,22 +114,104 @@ python -m jarvis.ingestion.cli.daily_health_check
 
 ## Celery Worker And Beat
 
-Worker:
+### Local Venv Runtime (Recommended For This MVP)
+
+Use this mode on Windows/local development. Docker runs only PostgreSQL, Redis and Qdrant;
+Celery Beat and workers run from the existing `.venv`, so the runtime does not rebuild
+Python/ML dependencies and does not download Docker worker images.
 
 ```powershell
 cd C:\code\diplom
-.\.venv\Scripts\Activate.ps1
-$env:PYTHONPATH='src'
-.\.venv\Scripts\celery -A jarvis.ingestion.tasks.celery_app worker -Q collector_queue,enrichment_queue -l info --pool=solo --without-mingle --without-gossip
+
+docker compose up -d
+powershell -ExecutionPolicy Bypass -File .\scripts\start_celery_runtime.ps1
 ```
 
-Beat:
+The script sets the local runtime environment before starting Celery:
 
 ```powershell
-cd C:\code\diplom
-.\.venv\Scripts\Activate.ps1
-$env:PYTHONPATH='src'
-.\.venv\Scripts\celery -A jarvis.ingestion.tasks.celery_app beat -l info
+$env:PYTHONPATH="src"
+$env:PROCESSING_EMBEDDING_BACKEND="flagembedding"
+$env:HF_HUB_OFFLINE="1"
+$env:TRANSFORMERS_OFFLINE="1"
+# HTTP_PROXY / HTTPS_PROXY / ALL_PROXY and lowercase variants are removed.
+```
+
+This local runtime starts:
+
+- `collector@%h` for `collector_queue`
+- `enrichment@%h` for `enrichment_queue`
+- `processing@%h` for `processing_queue`
+- Celery Beat for scheduled Layer 1-2 tasks
+
+Useful safe variants:
+
+```powershell
+# Start workers without Beat, so nothing is scheduled automatically.
+powershell -ExecutionPolicy Bypass -File .\scripts\start_celery_runtime.ps1 -NoBeat
+
+# Start only collector worker for diagnostics.
+powershell -ExecutionPolicy Bypass -File .\scripts\start_celery_runtime.ps1 -NoBeat -NoEnrichment -NoProcessing
+
+# Skip Docker infrastructure start if it is already running.
+powershell -ExecutionPolicy Bypass -File .\scripts\start_celery_runtime.ps1 -NoInfrastructure
+```
+
+Check local runtime status and queues:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\celery_runtime_status.ps1
+```
+
+Stop local runtime:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\stop_celery_runtime.ps1
+```
+
+### Docker Worker Profile (Experimental)
+
+The default infrastructure command still starts only PostgreSQL, Redis and Qdrant:
+
+```powershell
+docker compose up -d
+```
+
+The `workers` profile exists, but do not use it on a low-disk local machine yet:
+
+```powershell
+docker compose --profile workers up -d --build
+```
+
+Warning: this currently builds worker images from the full `requirements.txt`.
+On Linux Docker this can pull and unpack heavy ML packages, especially `torch`
+and transformer dependencies. For production, split the image by role first:
+light ingestion/beat dependencies separately from the heavy processing image.
+
+### Queue Inspection And Explicit Purge
+
+Inspect queues before purging anything:
+
+```powershell
+python scripts\inspect_celery_queues.py --limit 5
+```
+
+If a queue contains confirmed stale test tasks, purge that single queue explicitly:
+
+```powershell
+python scripts\purge_celery_queue.py --queue enrichment_queue --yes
+```
+
+Do not purge queues automatically during normal startup.
+
+### Runtime Smoke Check
+
+After starting workers and Beat:
+
+```powershell
+.\.venv\Scripts\celery -A jarvis.ingestion.tasks.celery_app inspect ping
+python scripts\inspect_celery_queues.py --limit 3
+python -m jarvis.ingestion.cli.daily_health_check --dry-run
 ```
 
 ## Tests
