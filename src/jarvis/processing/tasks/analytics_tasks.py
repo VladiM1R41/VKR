@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 @celery_app.task(
     name="jarvis.processing.update_term_vocabulary",
-    queue="processing_queue",
+    queue="analytics_queue",
     bind=True,
     soft_time_limit=600,
 )
@@ -38,7 +38,7 @@ def update_term_vocabulary_task(self) -> dict:
 
 @celery_app.task(
     name="jarvis.processing.update_collocations",
-    queue="processing_queue",
+    queue="analytics_queue",
     bind=True,
     soft_time_limit=600,
 )
@@ -57,7 +57,7 @@ def update_collocations_task(self) -> dict:
 
 @celery_app.task(
     name="jarvis.processing.update_entity_profiles",
-    queue="processing_queue",
+    queue="analytics_queue",
     bind=True,
     soft_time_limit=600,
 )
