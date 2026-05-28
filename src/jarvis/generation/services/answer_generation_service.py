@@ -68,6 +68,7 @@ from jarvis.generation.services.prompt_builder import (
 from jarvis.generation.services.response_cache import ResponseCache
 from jarvis.generation.services.providers.base import (
     LLMProvider,
+    LLMProviderError,
     LLMGenerationRequest,
     LLMGenerationResponse,
 )
@@ -137,6 +138,7 @@ class GenerationConfig:
     """Конфигурация генерации (переопределяет дефолты)."""
     max_input_tokens: int = 20000       # лимит входного контекста
     max_output_tokens: int = 1200       # лимит ответа
+    digest_max_output_tokens: int = 6500  # отдельный лимит для больших дайджестов
     temperature: float = 0.2            # низкая для groundedness
     enable_logging: bool = True         # сохранять ли в generation_logs
     enable_correction: bool = True      # one extra LLM pass for failed quality checks
@@ -628,6 +630,7 @@ class AnswerGenerationService:
         news_items: list[NewsWithContext],
         user_id: int | None = None,
         continuity_context: str = "",
+        digest_style: str | None = None,
     ) -> GenerationDigestResult:
         """Сгенерировать текст дайджеста из shortlist (из Слоя 4).
 
@@ -663,7 +666,13 @@ class AnswerGenerationService:
             user_query = (
                 f"Учти также, что в предыдущих дайджестах было:\n{continuity_context}\n\n"
             )
-        user_query += f"Составь дайджест из {len(assembled.documents)} источников ниже."
+        if digest_style:
+            user_query += self._digest_style_instruction(digest_style) + "\n\n"
+        user_query += (
+            f"Составь большой новостной дайджест из {len(assembled.documents)} источников ниже. "
+            "Используй доступные материалы широко: не ограничивайся несколькими предложениями, "
+            "выделяй тематические блоки и показывай связи между событиями там, где они подтверждаются источниками."
+        )
 
         prompt = build_prompt(
             mode=mode,
@@ -677,6 +686,7 @@ class AnswerGenerationService:
             user_prompt=prompt.user_prompt,
             context=prompt.context_block,
             mode=mode,
+            max_output_tokens=self._config.digest_max_output_tokens,
         )
 
         # Шаг 4: confidence
@@ -692,6 +702,7 @@ class AnswerGenerationService:
             answer_text=llm_response.content,
             documents=assembled.documents,
             base_confidence=confidence,
+            require_citations=False,
         )
         correction = self._maybe_correct_generation(
             response=llm_response,
@@ -702,9 +713,15 @@ class AnswerGenerationService:
             user_prompt=prompt.user_prompt,
             context=prompt.context_block,
             base_confidence=confidence,
+            max_output_tokens=self._config.digest_max_output_tokens,
+            require_citations=False,
         )
         llm_response = correction.response
         quality = correction.quality
+
+        if self._looks_like_provider_refusal(llm_response.content):
+            raise LLMProviderError("LLM provider refused to generate a digest for the selected context")
+
         latency_ms = int((time.monotonic() - t_start) * 1000)
 
         generation_log_id = self._save_generation_log_safely(
@@ -791,6 +808,7 @@ class AnswerGenerationService:
             news_id=news_item.news_id,
             source_name=news_item.source_name,
             title=news_item.title,
+            url=news_item.url,
         )]
         confidence = self._compute_confidence_from_items([news_item], assembled.documents)
         quality = self._evaluate_generation_quality(
@@ -862,13 +880,14 @@ class AnswerGenerationService:
         user_prompt: str,
         context: str,
         mode: GenerationMode,
+        max_output_tokens: int | None = None,
     ) -> LLMGenerationResponse:
         """Вызвать LLM-провайдер с собранным промптом."""
         request = LLMGenerationRequest(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             context=context,
-            max_output_tokens=self._config.max_output_tokens,
+            max_output_tokens=max_output_tokens or self._config.max_output_tokens,
             temperature=self._config.temperature,
             metadata={"mode": mode, "prompt_version": _PROMPT_VERSION},
         )
@@ -921,7 +940,13 @@ class AnswerGenerationService:
             return None
 
         documents_used = [
-            {"news_id": doc.news_id, "source": doc.source_name, "title": doc.title}
+            {
+                "news_id": doc.news_id,
+                "source": doc.source_name,
+                "title": doc.title,
+                "url": doc.url,
+                "published_at": doc.published_at,
+            }
             for doc in documents
         ]
         if context:
@@ -958,11 +983,12 @@ class AnswerGenerationService:
         answer_text: str,
         documents: list[DocumentContext],
         base_confidence: str,
+        require_citations: bool = True,
     ) -> QualityCheckResult:
         citation_result = self._validate_citations(answer_text, documents)
         groundedness_result = self._check_groundedness(answer_text, documents)
         citation_valid = citation_result.is_valid and (
-            citation_result.total_citations > 0 or not documents
+            not require_citations or citation_result.total_citations > 0 or not documents
         )
 
         confidence = base_confidence
@@ -990,6 +1016,8 @@ class AnswerGenerationService:
         user_prompt: str,
         context: str,
         base_confidence: str,
+        max_output_tokens: int | None = None,
+        require_citations: bool = True,
     ) -> CorrectionOutcome:
         """Retry once with a correction prompt when quality checks fail."""
         if not self._config.enable_correction:
@@ -1021,6 +1049,7 @@ class AnswerGenerationService:
             user_prompt=user_prompt,
             answer_text=response.content,
             quality=quality,
+            mode=mode,
         )
         try:
             corrected_response = self._call_provider(
@@ -1028,6 +1057,7 @@ class AnswerGenerationService:
                 user_prompt=correction_prompt,
                 context=context,
                 mode=mode,
+                max_output_tokens=max_output_tokens,
             )
         except Exception:
             logger.exception("Correction generation failed; keeping original answer")
@@ -1043,6 +1073,7 @@ class AnswerGenerationService:
             answer_text=corrected_response.content,
             documents=documents,
             base_confidence=base_confidence,
+            require_citations=require_citations,
         )
         if self._is_quality_improved(corrected_quality, quality):
             return CorrectionOutcome(
@@ -1068,17 +1099,38 @@ class AnswerGenerationService:
         )
 
     @staticmethod
+    def _looks_like_provider_refusal(text: str) -> bool:
+        normalized = " ".join((text or "").lower().split())
+        if not normalized:
+            return False
+        markers = (
+            "генеративные языковые модели не обладают собственным мнением",
+            "gigaChat не обладает собственным мнением".lower(),
+            "не транслирует мнение своих разработчиков",
+            "разговоры на некоторые темы временно ограничены",
+            "чтобы избежать ошибок и неправильного толкования",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
     def _build_correction_prompt(
         *,
         user_prompt: str,
         answer_text: str,
         quality: QualityCheckResult,
+        mode: GenerationMode,
     ) -> str:
+        citation_instruction = (
+            "Для дайджеста не добавляй блок «Источники», длинные URL и технические ссылки [Doc N] в основной текст. "
+            "Интерфейс покажет использованные статьи отдельными кнопками на основе metadata. "
+            "Сохрани большой связный объем дайджеста, если контекста достаточно."
+            if mode == "digest"
+            else "Каждое важное утверждение снабжай проверяемой ссылкой на источник: источник — заголовок или [Doc N]."
+        )
         return (
             "Исправь предыдущий ответ по правилам строгого RAG.\n"
             "Используй только факты из блока CONTEXT. Удали все неподтвержденные утверждения. "
-            "Каждое важное утверждение снабжай ссылкой на документ в формате [Doc N] "
-            "или (Источник, [Doc N]). Если данных недостаточно, скажи это явно.\n\n"
+            f"{citation_instruction} Если данных недостаточно, скажи это явно.\n\n"
             f"Причина исправления: citation_valid={quality.citation_valid}, "
             f"groundedness_score={quality.groundedness_score}, "
             f"recommendation={quality.recommendation}.\n\n"
@@ -1086,6 +1138,17 @@ class AnswerGenerationService:
             f"Предыдущий ответ:\n{answer_text}\n\n"
             "Верни только исправленный ответ без служебных комментариев."
         )
+
+    @staticmethod
+    def _digest_style_instruction(digest_style: str) -> str:
+        style = digest_style.strip().lower()
+        mapping = {
+            "brief": "Стиль дайджеста: компактнее, но без потери важных тем и источников.",
+            "detailed": "Стиль дайджеста: подробный обзор с контекстом, пояснениями и несколькими абзацами на каждую важную тему.",
+            "analytical": "Стиль дайджеста: аналитический; объясняй динамику, причины, ограничения и что может быть важно дальше.",
+            "editorial": "Стиль дайджеста: редакторский журнальный обзор; текст должен быть связным, живым и удобным для долгого чтения.",
+        }
+        return mapping.get(style, mapping["detailed"])
 
     @staticmethod
     def _is_quality_improved(
@@ -1159,6 +1222,7 @@ class AnswerGenerationService:
                 news_id=item.news_id,
                 source_name=item.source_name,
                 title=item.title,
+                url=item.url,
             )
 
         # Возвращаем только те, что реально использованы

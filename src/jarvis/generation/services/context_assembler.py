@@ -70,6 +70,7 @@ class NewsWithContext:
     information_type: str = "daily"
     urgency: str = "normal"
     event_cluster_id: int | None = None
+    url: str = ""
 
 
 # ───────────────────────────────────────────────────────────
@@ -163,6 +164,7 @@ def enrich_with_db_data(
             information_type=str(news.information_type) if news else info_type_map.get(nid, "daily"),
             urgency=str(news.urgency) if news else urgency_map.get(nid, "normal"),
             event_cluster_id=getattr(news, "event_cluster_id", None) if news else cluster_map.get(nid),
+            url=str(news.url or "") if news else "",
         ))
     return results
 
@@ -280,6 +282,7 @@ def trim_documents_to_budget(
                         published_at=doc.published_at,
                         title=doc.title,
                         content=trimmed_content,
+                        url=doc.url,
                     )
                 )
             break
@@ -323,6 +326,7 @@ def assemble_context_for_chat(
             published_at=item.published_at_str,
             title=item.title,
             content=item.content or "(нет текста)",
+            url=item.url,
         )
         for i, item in enumerate(sorted_items)
     ]
@@ -366,6 +370,12 @@ def assemble_context_for_digest(
         flat_items.extend(cluster.representatives)
         flat_items.extend(cluster.supporting)
 
+    system_tokens = estimate_token_count(system_prompt)
+    per_doc_chars = _digest_content_budget_chars(
+        n_documents=len(flat_items),
+        max_input_tokens=max_input_tokens,
+        system_tokens=system_tokens,
+    )
     documents = [
         DocumentContext(
             index=i + 1,
@@ -373,12 +383,12 @@ def assemble_context_for_digest(
             source_name=item.source_name,
             published_at=item.published_at_str,
             title=item.title,
-            content=item.content or "(нет текста)",
+            content=_digest_document_content(item, max_chars=per_doc_chars),
+            url=item.url,
         )
         for i, item in enumerate(flat_items)
     ]
 
-    system_tokens = estimate_token_count(system_prompt)
     trimmed_docs = trim_documents_to_budget(documents, max_input_tokens, system_tokens, user_tokens=0)
 
     total_tokens = system_tokens + sum(
@@ -396,3 +406,34 @@ def assemble_context_for_digest(
         n_clusters=len(clusters),
         trimmed=len(trimmed_docs) < len(flat_items),
     )
+
+
+def _digest_content_budget_chars(
+    *,
+    n_documents: int,
+    max_input_tokens: int,
+    system_tokens: int,
+) -> int:
+    if n_documents <= 0:
+        return 1200
+    available_tokens = max(1000, max_input_tokens - system_tokens)
+    target_chars = int((available_tokens * 1.5) / n_documents)
+    return max(600, min(1400, target_chars))
+
+
+def _digest_document_content(item: NewsWithContext, *, max_chars: int) -> str:
+    parts: list[str] = []
+    if item.topics:
+        parts.append("topics: " + ", ".join(str(topic) for topic in item.topics[:6]))
+    if item.entities:
+        parts.append("entities: " + ", ".join(str(entity) for entity in item.entities[:8]))
+    if item.snippet_lead:
+        parts.append(item.snippet_lead.strip())
+    if item.content:
+        content = item.content.strip()
+        if content and content not in parts:
+            parts.append(content)
+    text = "\n".join(part for part in parts if part) or "(нет текста)"
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
