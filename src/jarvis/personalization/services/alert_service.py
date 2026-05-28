@@ -24,6 +24,7 @@ from jarvis.db.models import (
     Topic,
     User,
     UserEntitySubscription,
+    UserTrackedKeyword,
 )
 from jarvis.personalization.models.alert_models import AlertBatch, AlertCandidate
 from jarvis.personalization.services.profile_update_service import SessionProfileStore
@@ -41,9 +42,13 @@ class AlertService:
         *,
         session_profile_store: SessionProfileStore | None = None,
         rate_limiter: AlertRateLimiter | None = None,
+        max_spike_alerts_per_news: int = 3,
+        max_alerts_per_batch: int = 50,
     ) -> None:
         self._session_profile_store = session_profile_store or SessionProfileStore()
         self._rate_limiter = rate_limiter or AlertRateLimiter()
+        self._max_spike_alerts_per_news = max(0, max_spike_alerts_per_news)
+        self._max_alerts_per_batch = max(1, max_alerts_per_batch)
 
     def build_alert_batch(
         self,
@@ -59,6 +64,7 @@ class AlertService:
 
         session_profile = self._session_profile_store.load(user_id)
         tracked_topic_ids = set(int(item) for item in session_profile.get("recent_topic_ids", []))
+        tracked_entity_ids = set(int(item) for item in session_profile.get("recent_entity_ids", []))
 
         subscription_rows = session.execute(
             select(
@@ -81,6 +87,7 @@ class AlertService:
         }
 
         spike_entities = self._load_spike_entities(session)
+        tracked_keywords = self._load_tracked_keywords(session, user_id)
         topic_names = self._load_topic_names(session)
         source_names = self._load_source_names(session)
 
@@ -89,6 +96,23 @@ class AlertService:
         for news in self._load_news(session, news_ids):
             entity_ids = self._load_news_entity_ids(session, news.id)
             topic_ids = self._load_news_topic_ids(session, news.id)
+            spike_alerts_for_news = 0
+
+            for keyword in self._matching_tracked_keywords(news, tracked_keywords):
+                alerts.append(
+                    AlertCandidate(
+                        user_id=user_id,
+                        news_id=news.id,
+                        alert_type="keyword_match",
+                        title=news.title,
+                        body=f"Новая статья по отслеживаемому ключевому слову: {keyword}",
+                        source_name=source_names.get(news.source_id),
+                        urgency=news.urgency,
+                        score=0.82,
+                        reasons=[f"tracked_keyword: {keyword}"],
+                        published_at=news.published_at,
+                    )
+                )
 
             for entity_id in entity_ids:
                 if entity_id in subscribed_entities:
@@ -109,7 +133,16 @@ class AlertService:
                                 published_at=news.published_at,
                             )
                         )
-                if entity_id in spike_entities:
+                if (
+                    entity_id in spike_entities
+                    and self._is_spike_alert_relevant(
+                        entity_id,
+                        subscribed_entities,
+                        subscription_flags,
+                        tracked_entity_ids,
+                    )
+                    and spike_alerts_for_news < self._max_spike_alerts_per_news
+                ):
                     flags = subscription_flags.get(entity_id, {})
                     if entity_id not in subscribed_entities or flags.get("alert_on_spike", True):
                         alerts.append(
@@ -127,6 +160,7 @@ class AlertService:
                                 published_at=news.published_at,
                             )
                         )
+                        spike_alerts_for_news += 1
 
             if news.information_type == "breaking" and self._has_high_match(topic_ids, tracked_topic_ids):
                 matched_topic = next((topic_names[topic_id] for topic_id in topic_ids if topic_id in tracked_topic_ids and topic_id in topic_names), None)
@@ -175,7 +209,7 @@ class AlertService:
             )
         ]
         eligible.sort(key=lambda item: item.score, reverse=True)
-        return AlertBatch(user_id=user_id, alerts=eligible)
+        return AlertBatch(user_id=user_id, alerts=eligible[: self._max_alerts_per_batch])
 
     def mark_alerts_sent(self, batch: AlertBatch) -> int:
         """Mark emitted alerts in cooldown state."""
@@ -200,6 +234,37 @@ class AlertService:
             )
         )
         return {int(row[0]): str(row[1]) for row in session.execute(stmt).all()}
+
+    @staticmethod
+    def _load_tracked_keywords(session: Session, user_id: int) -> list[str]:
+        rows = session.scalars(
+            select(UserTrackedKeyword.keyword).where(UserTrackedKeyword.user_id == user_id)
+        ).all()
+        return [str(row).strip().lower() for row in rows if str(row).strip()]
+
+    @staticmethod
+    def _matching_tracked_keywords(news: News, keywords: list[str]) -> list[str]:
+        if not keywords:
+            return []
+        haystack = " ".join(
+            [
+                str(news.title or ""),
+                str(news.snippet_lead or ""),
+                str(news.content or ""),
+            ]
+        ).lower()
+        return [keyword for keyword in keywords if keyword in haystack]
+
+    @staticmethod
+    def _is_spike_alert_relevant(
+        entity_id: int,
+        subscribed_entities: dict[int, str],
+        subscription_flags: dict[int, dict[str, bool]],
+        tracked_entity_ids: set[int],
+    ) -> bool:
+        if entity_id in subscribed_entities:
+            return subscription_flags.get(entity_id, {}).get("alert_on_spike", True)
+        return entity_id in tracked_entity_ids
 
     @staticmethod
     def _subscription_alert_flags(row: object) -> dict[str, bool]:
@@ -282,6 +347,7 @@ class AlertService:
             urgency=str(news.urgency or "normal"),
             event_cluster_id=getattr(news, "event_cluster_id", None),
             published_at_str=str(news.published_at or ""),
+            url=str(news.url or ""),
         )
 
         result = generation_service.generate_alert(

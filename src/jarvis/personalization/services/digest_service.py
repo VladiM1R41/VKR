@@ -49,6 +49,7 @@ class DigestOrchestrationService:
 
         selected: list[DigestCandidate] = []
         topic_counter: Counter[str] = Counter()
+        topic_cap = max(2, min(6, limit // 8 + 1))
 
         for result in ranked_response.results:
             if len(selected) >= limit:
@@ -61,7 +62,7 @@ class DigestOrchestrationService:
             if fresh_topics:
                 reasons.append(f"continuity_new_topic: {fresh_topics[0]}")
 
-            if result.topics and any(topic_counter[topic] >= 2 for topic in result.topics):
+            if result.topics and any(topic_counter[topic] >= topic_cap for topic in result.topics):
                 continue
 
             selected.append(
@@ -139,6 +140,13 @@ class DigestOrchestrationService:
             content_hash=shortlist.content_hash,
         )
         if existing is not None:
+            if content_text.strip():
+                existing.content_text = content_text
+                existing.generation_log_id = generation_log_id
+                existing.news_count = len(shortlist.candidates)
+                existing.topics_covered = list(shortlist.topics_covered)
+                existing.generated_at = datetime.now(UTC)
+                session.commit()
             return existing
 
         digest = Digest(
@@ -244,6 +252,7 @@ class DigestOrchestrationService:
         shortlist: DigestShortlist,
         generation_service: AnswerGenerationService,
         continuity_context: str = "",
+        digest_style: str | None = None,
     ) -> tuple[str, int | None]:
         """Сгенерировать текст дайджеста через L5 и обновить digest.
 
@@ -291,6 +300,7 @@ class DigestOrchestrationService:
                     information_type=str((news.extra or {}).get("information_type", "daily")),
                     urgency=str((news.extra or {}).get("urgency", "normal")),
                     event_cluster_id=getattr(news, "event_cluster_id", None),
+                    url=str(news.url or ""),
                 )
             )
 
@@ -309,6 +319,7 @@ class DigestOrchestrationService:
             news_items=news_items,
             user_id=shortlist.user_id,
             continuity_context=continuity_context,
+            digest_style=digest_style,
         )
 
         log_event(

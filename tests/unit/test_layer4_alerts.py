@@ -41,6 +41,7 @@ class FakeSession:
                 urgency="critical",
                 channel_type="RSS",
                 url="u10",
+                content="keyword-check",
             ),
             11: News(
                 id=11,
@@ -61,6 +62,8 @@ class FakeSession:
         self.subscription_rows = [(7, "ЦБ РФ")]
         self.spike_rows = [(7, "ЦБ РФ")]
 
+        self.tracked_keywords = []
+
     def get(self, model, key):
         if model.__name__ == "User":
             return self.users.get(key)
@@ -72,6 +75,8 @@ class FakeSession:
             return ScalarRows(self.topic_rows)
         if "FROM sources" in text:
             return ScalarRows(self.source_rows)
+        if "FROM user_tracked_keywords" in text:
+            return ScalarRows(self.tracked_keywords)
         raise AssertionError(text)
 
     def execute(self, stmt):
@@ -158,3 +163,43 @@ def test_alert_service_filters_cooldown_and_marks_sent() -> None:
     sent_count = service.mark_alerts_sent(batch)
     assert sent_count == len(batch.alerts)
     assert limiter.marked
+
+
+def test_alert_service_uses_tracked_keywords() -> None:
+    session = FakeSession()
+    session.tracked_keywords = ["keyword-check"]
+    service = FakeAlertService(
+        session_profile_store=FakeSessionStore(
+            {
+                "recent_news_ids": [],
+                "recent_topic_ids": [],
+                "recent_entity_ids": [],
+                "last_updated_at": datetime.now(UTC).isoformat(),
+            }
+        ),
+        rate_limiter=FakeRateLimiter(),
+    )
+
+    batch = service.build_alert_batch(session, user_id=1, news_ids=[10])
+
+    assert any(item.alert_type == "keyword_match" for item in batch.alerts)
+
+
+def test_alert_service_does_not_emit_unrelated_spike_alerts() -> None:
+    session = FakeSession()
+    session.subscription_rows = []
+    service = FakeAlertService(
+        session_profile_store=FakeSessionStore(
+            {
+                "recent_news_ids": [],
+                "recent_topic_ids": [],
+                "recent_entity_ids": [],
+                "last_updated_at": datetime.now(UTC).isoformat(),
+            }
+        ),
+        rate_limiter=FakeRateLimiter(),
+    )
+
+    batch = service.build_alert_batch(session, user_id=1, news_ids=[10])
+
+    assert all(item.alert_type != "alert_spike" for item in batch.alerts)
