@@ -107,11 +107,25 @@ class SessionProfileStore:
 class ProfileUpdateService:
     """Update long-term and short-term profile from interaction events."""
 
-    def __init__(self, session_store: SessionProfileStore | None = None, alpha: float = 0.25) -> None:
+    def __init__(
+        self,
+        session_store: SessionProfileStore | None = None,
+        alpha: float = 0.25,
+        max_topics_per_interaction: int = 5,
+        max_entities_per_interaction: int = 8,
+    ) -> None:
         self._session_store = session_store or SessionProfileStore()
         self._alpha = alpha
+        self._max_topics_per_interaction = max(1, max_topics_per_interaction)
+        self._max_entities_per_interaction = max(1, max_entities_per_interaction)
 
-    def update_from_interaction(self, session: Session, interaction_id: int) -> ProfileUpdateResult:
+    def update_from_interaction(
+        self,
+        session: Session,
+        interaction_id: int,
+        *,
+        commit: bool = True,
+    ) -> ProfileUpdateResult:
         """Apply one persisted interaction to user profile state."""
         interaction = session.get(UserInteraction, interaction_id)
         if interaction is None:
@@ -125,16 +139,8 @@ class ProfileUpdateService:
             raise ValueError(f"News {interaction.news_id} not found")
 
         signal = self._resolve_signal(interaction.action, interaction.dwell_time_sec)
-        topic_ids = list(
-            session.scalars(
-                select(NewsTopic.topic_id).where(NewsTopic.news_id == interaction.news_id)
-            ).all()
-        )
-        entity_ids = list(
-            session.scalars(
-                select(NewsEntity.entity_id).where(NewsEntity.news_id == interaction.news_id)
-            ).all()
-        )
+        topic_ids = self._load_news_topic_ids(session, interaction.news_id)
+        entity_ids = self._load_news_entity_ids(session, interaction.news_id)
 
         explicit_topic_ids = self._explicit_ids(user, "explicit_topic_ids")
         explicit_entity_ids = self._explicit_ids(user, "explicit_entity_ids")
@@ -147,7 +153,8 @@ class ProfileUpdateService:
             topic_ids=topic_ids,
             entity_ids=entity_ids,
         )
-        session.commit()
+        if commit:
+            session.commit()
 
         return ProfileUpdateResult(
             interaction_id=interaction.id,
@@ -158,6 +165,24 @@ class ProfileUpdateService:
             updated_entities=updated_entities,
             updated_source_id=news.source_id,
         )
+
+    def _load_news_topic_ids(self, session: Session, news_id: int) -> list[int]:
+        stmt = (
+            select(NewsTopic.topic_id)
+            .where(NewsTopic.news_id == news_id)
+            .order_by(NewsTopic.confidence.desc(), NewsTopic.topic_id.asc())
+            .limit(self._max_topics_per_interaction)
+        )
+        return [int(value) for value in session.scalars(stmt).all()]
+
+    def _load_news_entity_ids(self, session: Session, news_id: int) -> list[int]:
+        stmt = (
+            select(NewsEntity.entity_id)
+            .where(NewsEntity.news_id == news_id)
+            .order_by(NewsEntity.mention_count.desc(), NewsEntity.entity_id.asc())
+            .limit(self._max_entities_per_interaction)
+        )
+        return [int(value) for value in session.scalars(stmt).all()]
 
     def get_session_profile(self, user_id: int) -> dict:
         """Return current short-term session profile."""

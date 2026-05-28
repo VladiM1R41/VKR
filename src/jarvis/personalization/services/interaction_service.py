@@ -118,6 +118,8 @@ class InteractionLoggingService:
         self,
         session: Session,
         event: InteractionEventRequest,
+        *,
+        commit: bool = True,
     ) -> InteractionEventResponse:
         """Persist one interaction event and update short-term seen history."""
         self._ensure_user_and_news(session, user_id=event.user_id, news_id=event.news_id)
@@ -134,7 +136,8 @@ class InteractionLoggingService:
         )
         session.add(interaction)
         session.flush()
-        session.commit()
+        if commit:
+            session.commit()
         session.refresh(interaction)
 
         self._seen_history.mark_seen(event.news_id, user_id=event.user_id)
