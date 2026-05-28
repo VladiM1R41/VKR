@@ -23,6 +23,14 @@ _MIN_FREQUENCY_FOR_EXPANSION = 7
 _MAX_EXPANSIONS = 3
 _COLLOCATION_TTL_SECONDS = 15 * 60
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9-]+")
+_BROAD_CONTEXT_TERMS = {
+    "армения",
+    "китай",
+    "россия",
+    "российский",
+    "сша",
+    "цена",
+}
 
 _collocation_cache: dict[str, object] = {
     "loaded_at": 0.0,
@@ -94,6 +102,17 @@ def _tokens(text: str) -> set[str]:
     return {token.lower() for token in _TOKEN_RE.findall(text)}
 
 
+def _should_skip_broad_context_expansion(query_tokens: set[str], term_a: str, term_b: str) -> bool:
+    """Avoid drifting multi-term queries through broad single-token expansions."""
+    if len(query_tokens) < 3:
+        return False
+    phrase_tokens = {term_a, term_b}
+    matched = phrase_tokens & query_tokens
+    if len(matched) != 1:
+        return False
+    return next(iter(matched)) in _BROAD_CONTEXT_TERMS
+
+
 def _contains_known_phrase(query_tokens: set[str], collocations: list[tuple]) -> bool:
     if len(query_tokens) < 2:
         return False
@@ -130,7 +149,11 @@ def expand_query_with_collocations(query: str) -> list[str]:
         phrase_tokens = {term_a, term_b}
         matched = phrase_tokens & query_tokens
         full_phrase_already_present = phrase_tokens <= query_tokens
-        if matched and not full_phrase_already_present:
+        if (
+            matched
+            and not full_phrase_already_present
+            and not _should_skip_broad_context_expansion(query_tokens, term_a, term_b)
+        ):
             expansions.append(phrase)
             seen.add(phrase)
 

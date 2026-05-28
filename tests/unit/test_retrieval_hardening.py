@@ -153,6 +153,7 @@ def test_search_sorts_by_final_score_after_rerank(monkeypatch) -> None:
             ]
 
     service._qdrant = FakeQdrant()
+    service._postgres_fts = type("FakeFTS", (), {"search": lambda self, query, **kwargs: []})()
     service._reranker = FakeReranker()
 
     response = service.search(SearchRequest(query="ставка", limit=2))
@@ -337,6 +338,20 @@ def test_query_expansion_skips_when_query_already_contains_known_phrase(monkeypa
     )
 
     assert expand_query_with_collocations("искусственный интеллект") == []
+
+
+def test_query_expansion_avoids_broad_context_drift_for_multi_term_queries(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "jarvis.retrieval.services.query_expansion._load_collocations",
+        lambda: [
+            ("сша", "дональд", 8.0, 600),
+            ("сша", "марко", 8.0, 80),
+            ("китай", "индия", 8.0, 80),
+        ],
+    )
+
+    assert expand_query_with_collocations("китай сша торговый пошлина") == []
+    assert expand_query_with_collocations("сша") == ["сша дональд", "сша марко"]
 
 
 def test_rate_limiter_uses_atomic_lua_eval(monkeypatch) -> None:

@@ -117,14 +117,14 @@ class QdrantSearchService:
             must_conditions.append(
                 models.FieldCondition(
                     key="published_at",
-                    range=models.Range(gte=date_from.isoformat()),
+                    range=models.DatetimeRange(gte=date_from),
                 )
             )
         if date_to:
             must_conditions.append(
                 models.FieldCondition(
                     key="published_at",
-                    range=models.Range(lte=date_to.isoformat()),
+                    range=models.DatetimeRange(lte=date_to),
                 )
             )
         if source_ids:

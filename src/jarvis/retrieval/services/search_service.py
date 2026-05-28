@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 from jarvis.core.logging import log_event
+from jarvis.core.settings import get_settings
 from jarvis.processing.ir.lemmatize import lemmatize_text
 from jarvis.processing.services.embedding_runtime import encode_texts
 from jarvis.retrieval.models.search_models import (
@@ -36,6 +38,44 @@ from jarvis.retrieval.services.search_logger import SearchLogger
 
 logger = logging.getLogger(__name__)
 
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_SHORT_QUERY_TERMS = {
+    "ai",
+    "it",
+    "ии",
+    "мвд",
+    "мид",
+    "оон",
+    "рф",
+    "сша",
+    "цб",
+}
+_QUERY_STOP_TERMS = {
+    "а",
+    "без",
+    "бы",
+    "в",
+    "во",
+    "для",
+    "до",
+    "и",
+    "из",
+    "или",
+    "к",
+    "как",
+    "на",
+    "не",
+    "о",
+    "об",
+    "от",
+    "по",
+    "при",
+    "с",
+    "со",
+    "что",
+    "это",
+}
+
 
 def compute_final_score(
     rerank_score: float,
@@ -47,6 +87,7 @@ def compute_final_score(
     information_type: str = "daily",
     value_score: Optional[float] = None,
     payload_freshness: Optional[float] = None,
+    query_match_score: Optional[float] = None,
 ) -> float:
     """Combine relevance, trust, grade and freshness only at the final step."""
     grade_norm = 1.0 - (content_grade - 1) / 5.0
@@ -71,6 +112,8 @@ def compute_final_score(
         freshness = 0.5
 
     zone_boost = 1.2 if zone == "title" else 1.0
+    if query_match_score is not None and query_match_score < 0.05:
+        zone_boost = 1.0
     raw = (
         0.50 * relevance
         + 0.20 * trust_score
@@ -79,7 +122,13 @@ def compute_final_score(
     )
     if value_score is not None:
         raw = 0.80 * raw + 0.20 * max(0.0, min(1.0, float(value_score)))
-    return min(1.0, raw * zone_boost)
+    final_score = min(1.0, raw * zone_boost)
+    if query_match_score is not None:
+        query_match_score = max(0.0, min(1.0, float(query_match_score)))
+        final_score = 0.86 * final_score + 0.14 * query_match_score
+        if abs(rerank_score - 0.5) < 0.01 and query_match_score < 0.20:
+            final_score *= 0.92
+    return min(1.0, final_score)
 
 
 def deduplicate_by_article(results: list[RerankedResult]) -> list[RerankedResult]:
@@ -133,10 +182,128 @@ def _merge_retrieval_candidates(*candidate_lists: list[SearchResult]) -> list[Se
     return merged
 
 
+def _normalize_text(text: str) -> str:
+    return text.lower().replace("ё", "е")
+
+
+def _tokens(text: str) -> set[str]:
+    return set(_TOKEN_RE.findall(_normalize_text(text)))
+
+
+def _quality_query_terms(query: str) -> set[str]:
+    """Return query terms useful for lexical quality signals."""
+    terms = _tokens(query)
+    try:
+        terms |= _tokens(lemmatize_text(query))
+    except Exception:
+        pass
+    return {
+        term
+        for term in terms
+        if term not in _QUERY_STOP_TERMS
+        and (term.isdigit() or len(term) >= 3 or term in _SHORT_QUERY_TERMS)
+    }
+
+
+def _field_hit_ratio(query_terms: set[str], text: str) -> float:
+    if not query_terms or not text:
+        return 0.0
+    normalized = _normalize_text(text)
+    hits = sum(1 for term in query_terms if term in normalized)
+    return hits / len(query_terms)
+
+
+def _candidate_query_match_score_for_terms(query_terms: set[str], candidate: SearchResult, query: str = "") -> float:
+    """Estimate how visibly a candidate matches the user query."""
+    if not query_terms:
+        return 0.0
+
+    title = candidate.title or ""
+    snippet = candidate.snippet_lead or ""
+    metadata = " ".join(
+        [
+            " ".join(candidate.entities or []),
+            " ".join(candidate.topics or []),
+            " ".join(candidate.keywords or []),
+        ]
+    )
+    body = " ".join([candidate.lemma_text or "", (candidate.text or "")[:4000]])
+
+    score = (
+        0.42 * _field_hit_ratio(query_terms, title)
+        + 0.24 * _field_hit_ratio(query_terms, snippet)
+        + 0.22 * _field_hit_ratio(query_terms, metadata)
+        + 0.12 * _field_hit_ratio(query_terms, body)
+    )
+    normalized_query = _normalize_text(query)
+    visible_text = _normalize_text(" ".join([title, snippet]))
+    if len(normalized_query) >= 8 and normalized_query in visible_text:
+        score += 0.20
+    if any(term.isdigit() for term in query_terms):
+        number_terms = {term for term in query_terms if term.isdigit()}
+        if any(term in visible_text or term in body for term in number_terms):
+            score += 0.10
+    return min(1.0, score)
+
+
+def _candidate_query_match_score(query: str, candidate: SearchResult) -> float:
+    return _candidate_query_match_score_for_terms(_quality_query_terms(query), candidate, query)
+
+
+def _candidate_selection_score(query_terms: set[str], candidate: SearchResult, max_score: float) -> float:
+    retrieval_score = candidate.score / max_score if max_score > 0 else 0.0
+    retrieval_score = max(0.0, min(1.0, retrieval_score))
+    query_match = _candidate_query_match_score_for_terms(query_terms, candidate)
+    lexical_bonus = 0.05 if (candidate.retrieval_mode or "").startswith("postgres_fts") else 0.0
+    return 0.62 * query_match + 0.33 * retrieval_score + lexical_bonus
+
+
+def _split_rerank_candidates(
+    candidates: list[SearchResult],
+    max_candidates: int,
+    *,
+    query: str = "",
+    use_quality_signals: bool = False,
+) -> tuple[list[SearchResult], list[SearchResult]]:
+    """Select a small article-deduplicated subset for expensive reranking."""
+    if max_candidates <= 0 or len(candidates) <= max_candidates:
+        return candidates, []
+
+    max_score = max((candidate.score for candidate in candidates), default=1.0) or 1.0
+    query_terms = _quality_query_terms(query) if use_quality_signals else set()
+
+    best_by_article: dict[int, SearchResult] = {}
+    for candidate in candidates:
+        current = best_by_article.get(candidate.news_id)
+        if current is None:
+            best_by_article[candidate.news_id] = candidate
+            continue
+        if use_quality_signals:
+            candidate_score = _candidate_selection_score(query_terms, candidate, max_score)
+            current_score = _candidate_selection_score(query_terms, current, max_score)
+            if candidate_score > current_score:
+                best_by_article[candidate.news_id] = candidate
+        elif candidate.score > current.score:
+            best_by_article[candidate.news_id] = candidate
+
+    if use_quality_signals:
+        selected = sorted(
+            best_by_article.values(),
+            key=lambda item: _candidate_selection_score(query_terms, item, max_score),
+            reverse=True,
+        )[:max_candidates]
+    else:
+        selected = sorted(best_by_article.values(), key=lambda item: item.score, reverse=True)[:max_candidates]
+    selected_point_ids = {item.point_id for item in selected}
+    remainder = [item for item in candidates if item.point_id not in selected_point_ids]
+    return selected, remainder
+
+
 class SearchService:
     """Main search orchestration."""
 
     def __init__(self) -> None:
+        self._settings = get_settings()
         self._qdrant = QdrantSearchService()
         self._postgres_fts = PostgresFTSSearchService()
         self._reranker = RerankingService()
@@ -272,8 +439,23 @@ class SearchService:
                 raw_results = _merge_retrieval_candidates(raw_results, lexical_results)
                 retrieval_mode = "qdrant_hybrid+postgres_fts"
 
-        reranked = self._reranker.rerank(effective_query, raw_results)
+        rerank_candidates, neutral_candidates = _split_rerank_candidates(
+            raw_results,
+            self._settings.reranker_max_candidates,
+            query=effective_query,
+            use_quality_signals=self._settings.search_quality_signals_enabled,
+        )
+        reranked = self._reranker.rerank(effective_query, rerank_candidates)
+        reranked.extend(
+            RerankedResult(result=candidate, rerank_score=0.5)
+            for candidate in neutral_candidates
+        )
         max_retrieval_score = max((item.result.score for item in reranked), default=1.0) or 1.0
+        quality_query_terms = (
+            _quality_query_terms(effective_query)
+            if self._settings.search_quality_signals_enabled
+            else set()
+        )
 
         best_per_article: dict[int, SearchResultModel] = {}
         for item in reranked:
@@ -288,6 +470,11 @@ class SearchService:
                 information_type=r.information_type,
                 value_score=r.value_score,
                 payload_freshness=r.freshness,
+                query_match_score=(
+                    _candidate_query_match_score_for_terms(quality_query_terms, r, effective_query)
+                    if quality_query_terms
+                    else None
+                ),
             )
             result_model = SearchResultModel(
                 chunk_id=r.point_id,
