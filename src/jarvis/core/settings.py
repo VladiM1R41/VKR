@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     processing_analytics_max_articles: int = Field(default=0, alias="PROCESSING_ANALYTICS_MAX_ARTICLES")
     processing_embedding_backend: str = Field(default="auto", alias="PROCESSING_EMBEDDING_BACKEND")
     celery_enable_layer4_schedule: bool = Field(default=False, alias="CELERY_ENABLE_LAYER4_SCHEDULE")
+    reranker_enabled: bool = Field(default=True, alias="RERANKER_ENABLED")
+    reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3", alias="RERANKER_MODEL")
+    reranker_device: str = Field(default="auto", alias="RERANKER_DEVICE")
+    reranker_max_candidates: int = Field(default=12, alias="RERANKER_MAX_CANDIDATES")
+    reranker_max_doc_chars: int = Field(default=1200, alias="RERANKER_MAX_DOC_CHARS")
+    reranker_max_length: int = Field(default=256, alias="RERANKER_MAX_LENGTH")
+    reranker_batch_size: int = Field(default=4, alias="RERANKER_BATCH_SIZE")
+    reranker_passage_mode: str = Field(default="best", alias="RERANKER_PASSAGE_MODE")
+    search_quality_signals_enabled: bool = Field(default=True, alias="SEARCH_QUALITY_SIGNALS_ENABLED")
 
     jarvis_llm_provider: str = Field(default="gigachat", alias="JARVIS_LLM_PROVIDER")
     jarvis_llm_model: str = Field(default="gigachat-max", alias="JARVIS_LLM_MODEL")
@@ -88,6 +97,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "PROCESSING_EMBEDDING_BACKEND must be one of: auto, flagembedding, sentence-transformers."
             )
+        if self.reranker_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("RERANKER_DEVICE must be one of: auto, cpu, cuda.")
+        if self.reranker_max_candidates < 0:
+            raise ValueError("RERANKER_MAX_CANDIDATES must be non-negative.")
+        if self.reranker_max_doc_chars < 0:
+            raise ValueError("RERANKER_MAX_DOC_CHARS must be non-negative.")
+        if self.reranker_max_length < 0:
+            raise ValueError("RERANKER_MAX_LENGTH must be non-negative.")
+        if self.reranker_batch_size < 0:
+            raise ValueError("RERANKER_BATCH_SIZE must be non-negative.")
+        if self.reranker_passage_mode not in {"best", "prefix"}:
+            raise ValueError("RERANKER_PASSAGE_MODE must be one of: best, prefix.")
         if self.jarvis_llm_timeout_sec <= 0:
             raise ValueError("JARVIS_LLM_TIMEOUT_SEC must be positive.")
         if self.jarvis_llm_retry_attempts < 0:
