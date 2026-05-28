@@ -676,9 +676,18 @@ export interface components {
             query: string;
             /**
              * Limit
-             * @default 20
+             * @default 40
              */
             limit: number;
+            /** Digest Style */
+            digest_style: "brief" | "detailed" | "analytical" | "editorial" | null;
+            /**
+             * Topics
+             * @default []
+             */
+            topics: string[];
+            /** Period Hours */
+            period_hours: number | null;
             /**
              * Force
              * @default false

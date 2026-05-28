@@ -38,6 +38,16 @@ function looksLikeLegacyDigest(text: string | undefined): boolean {
   )
 }
 
+function stripDigestSourcesBlock(text: string): string {
+  return text.replace(/\n\s*(?:#{1,4}\s*)?(?:[📝]\s*)?\**Источники:?\**[\s\S]*$/i, '').trim()
+}
+
+function compactTitle(title: string | undefined, maxLength = 42): string {
+  const clean = (title || '').replace(/\s+/g, ' ').trim()
+  if (!clean) return 'источник'
+  return clean.length > maxLength ? `${clean.slice(0, maxLength - 1).trim()}…` : clean
+}
+
 export function DigestPage() {
   const queryClient = useQueryClient()
   const digest = useQuery({ queryKey: queryKeys.digest(), queryFn: api.digest })
@@ -76,10 +86,12 @@ export function DigestPage() {
   })
 
   const generate = useMutation({
-    mutationFn: () => api.generateDigest(digestQuery),
+    mutationFn: () => api.generateDigest(digestQuery, selectedTopics, periodHours),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.digest() }),
   })
   const digestText = digest.data?.content_text ?? ''
+  const digestBodyText = stripDigestSourcesBlock(digestText)
+  const sourceButtons = digest.data?.items?.slice(0, 10) ?? []
   const legacyDigest = looksLikeLegacyDigest(digestText)
 
   if (digest.isLoading) return <LoadingBlock label="Загружаю дайджест..." />
@@ -189,41 +201,46 @@ export function DigestPage() {
         )}
 
         <p className={`mt-8 whitespace-pre-wrap text-lg leading-8 ${legacyDigest ? 'text-ink/55' : ''}`}>
-          {digestText || 'Дайджест пока не сформирован.'}
+          {digestBodyText || digestText || 'Дайджест пока не сформирован.'}
         </p>
 
-        {!!digest.data?.items?.length && (
+        {!!sourceButtons.length && (
           <div className="mt-8">
-            <h3 className="font-display text-2xl font-bold">Источники дайджеста</h3>
-            <div className="mt-3 grid gap-3">
-              {digest.data.items.map((item) => (
-                <div
-                  key={`${item.news_id}-${item.position}`}
-                  className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-blue-100 bg-white p-3 text-sm"
-                >
-                  <span>
-                    #{item.position} · {item.title || `news ${item.news_id}`}
-                  </span>
-                  <div className="flex flex-wrap gap-2">
-                    <Link
-                      to={`/news/${item.news_id}`}
-                      className="rounded-full bg-white px-3 py-1.5 text-xs font-semibold text-ink hover:bg-paper"
-                    >
-                      В системе
-                    </Link>
-                    {item.url && (
-                      <a
-                        href={item.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="rounded-full bg-[#2563eb] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#1d4ed8]"
-                      >
-                        Открыть источник
-                      </a>
-                    )}
-                  </div>
-                </div>
-              ))}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <h3 className="font-display text-2xl font-bold">Источники</h3>
+              {!!digest.data?.items?.length && digest.data.items.length > sourceButtons.length && (
+                <span className="text-sm text-ink/55">
+                  показаны первые {sourceButtons.length} из {digest.data.items.length}
+                </span>
+              )}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {sourceButtons.map((item) => {
+                const label = `#${item.position} ${compactTitle(item.title)}`
+                const className =
+                  'max-w-[260px] truncate rounded-full border border-blue-100 bg-white px-3 py-2 text-sm font-semibold text-ink shadow-sm hover:border-[#2563eb] hover:text-[#2563eb]'
+                return item.url ? (
+                  <a
+                    key={`${item.news_id}-${item.position}`}
+                    href={item.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={item.title || `news ${item.news_id}`}
+                    className={className}
+                  >
+                    {label}
+                  </a>
+                ) : (
+                  <Link
+                    key={`${item.news_id}-${item.position}`}
+                    to={`/news/${item.news_id}`}
+                    title={item.title || `news ${item.news_id}`}
+                    className={className}
+                  >
+                    {label}
+                  </Link>
+                )
+              })}
             </div>
           </div>
         )}

@@ -181,10 +181,16 @@ export const api = {
     }),
   interactions: () => request<any>('/api/v1/profile/interactions?limit=12'),
   digest: () => request<DigestResponse>('/api/v1/digest'),
-  generateDigest: (query?: string) =>
+  generateDigest: (query?: string, topics: string[] = [], periodHours?: number) =>
     request<DigestResponse>('/api/v1/digest/generate', {
       method: 'POST',
-      body: JSON.stringify({ force: true, query: query || 'главные новости сегодня' }),
+      body: JSON.stringify({
+        force: true,
+        query: query || 'главные новости сегодня',
+        topics,
+        period_hours: periodHours,
+        digest_style: 'editorial',
+      }),
     }),
   adminOverview: () => request<any>('/api/v1/admin/overview'),
   adminSources: () => request<any>('/api/v1/admin/sources'),

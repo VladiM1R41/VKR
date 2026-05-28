@@ -23,7 +23,7 @@ from jarvis.generation.services.chat_service import ChatService
 from jarvis.generation.services.context_assembler import NewsWithContext
 from jarvis.personalization.models.ranking_models import PersonalizedResult
 from jarvis.personalization.services.pipeline_service import PersonalizationPipelineService
-from jarvis.retrieval.models.search_models import SearchRequest
+from jarvis.retrieval.models.search_models import SearchFilters, SearchRequest
 from jarvis.retrieval.services.search_service import SearchService
 
 router = APIRouter()
@@ -59,13 +59,14 @@ def _personalized_context(session: Session, results: list[PersonalizedResult]) -
                 information_type=item.information_type,
                 urgency=item.urgency,
                 event_cluster_id=item.event_cluster_id,
+                url=str(news.url or ""),
             )
         )
     return context
 
 
-def _search_context(session: Session, *, query: str, limit: int, user_id: int):
-    l3_response = SearchService().search(SearchRequest(query=query, limit=limit), user_id=str(user_id))
+def _search_context(session: Session, *, query: str, limit: int, user_id: int, filters: SearchFilters | None = None):
+    l3_response = SearchService().search(SearchRequest(query=query, limit=limit, filters=filters), user_id=str(user_id))
     l4_response = PersonalizationPipelineService().personalize(session, user_id=user_id, response=l3_response)
     return l3_response, l4_response, _personalized_context(session, l4_response.results)
 
@@ -173,7 +174,12 @@ def chat(
         generation_log_id=result.generation_log_id,
         search_time_ms=l3_response.search_time_ms,
         sources=[
-            ChatSource(news_id=source.news_id, source_name=source.source_name, title=source.title)
+            ChatSource(
+                news_id=source.news_id,
+                source_name=source.source_name,
+                title=source.title,
+                url=source.url,
+            )
             for source in result.sources
         ],
         citation_valid=result.citation_valid,
@@ -202,4 +208,3 @@ async def chat_ws(websocket: WebSocket) -> None:
         await websocket.send_json({"type": "error", "detail": str(exc)})
     finally:
         await websocket.close()
-
