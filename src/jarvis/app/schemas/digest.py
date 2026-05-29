@@ -42,3 +42,8 @@ class DigestListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class DigestAudioStatusResponse(BaseModel):
+    status: str
+    detail: dict = Field(default_factory=dict)

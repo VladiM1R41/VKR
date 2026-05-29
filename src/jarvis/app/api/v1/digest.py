@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session
 
 from jarvis.app.api.v1.chat import _search_context
 from jarvis.app.dependencies import get_current_user_id, get_db
-from jarvis.app.schemas.digest import DigestGenerateRequest, DigestItemView, DigestListResponse, DigestResponse
+from jarvis.app.schemas.digest import (
+    DigestAudioStatusResponse,
+    DigestGenerateRequest,
+    DigestItemView,
+    DigestListResponse,
+    DigestResponse,
+)
 from jarvis.db.models import Digest, DigestItem, News, User
 from jarvis.generation.services.answer_generation_service import build_answer_generation_service
 from jarvis.generation.services.providers.base import LLMProviderError
@@ -200,12 +206,20 @@ def list_digests(
     )
 
 
-@router.get("/api/v1/digest/audio")
+@router.get(
+    "/api/v1/digest/audio",
+    response_model=None,
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"audio/wav": {}}, "description": "Digest audio file"},
+        202: {"model": DigestAudioStatusResponse, "description": "Audio generation has not completed yet"},
+    },
+)
 def digest_audio(
     digest_id: int,
     session: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
-):
+) -> FileResponse | JSONResponse:
     digest = session.scalar(select(Digest).where(Digest.id == digest_id, Digest.user_id == user_id))
     if digest is None:
         raise HTTPException(status_code=404, detail="Digest not found")

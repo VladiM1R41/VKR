@@ -13,9 +13,32 @@ def test_layer6_openapi_contains_core_routes() -> None:
 
     assert schema["info"]["title"] == "Newscope API"
     assert "/api/v1/news/feed" in schema["paths"]
+    assert "/api/v1/news/sources" in schema["paths"]
+    assert "/api/v1/news/topics" in schema["paths"]
     assert "/api/v1/search" in schema["paths"]
     assert "/api/v1/chat" in schema["paths"]
     assert "/api/v1/admin/overview" in schema["paths"]
+
+
+def test_layer6_openapi_describes_entity_and_audio_contracts() -> None:
+    schema = app.openapi()
+
+    trending_response = schema["paths"]["/api/v1/entities/trending"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    detail_response = schema["paths"]["/api/v1/entities/{entity_id}"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    audio_responses = schema["paths"]["/api/v1/digest/audio"]["get"]["responses"]
+
+    assert trending_response["$ref"] == "#/components/schemas/TrendingEntitiesResponse"
+    assert detail_response["$ref"] == "#/components/schemas/EntityDetailResponse"
+    assert "audio/wav" in audio_responses["200"]["content"]
+    assert "application/json" not in audio_responses["200"]["content"]
+    assert (
+        audio_responses["202"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/DigestAudioStatusResponse"
+    )
 
 
 def test_layer6_health_endpoint() -> None:

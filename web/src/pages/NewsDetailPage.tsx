@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
 
-import { API_URL, api } from '../shared/api/client'
+import { api } from '../shared/api/client'
 import { queryKeys } from '../shared/api/queryKeys'
 import { ErrorBlock, LoadingBlock } from '../shared/ui/State'
 
@@ -16,13 +16,7 @@ export function NewsDetailPage() {
   const queryClient = useQueryClient()
   const news = useQuery({ queryKey: queryKeys.news(newsId), queryFn: () => api.news(newsId), enabled: Boolean(newsId) })
   const feedback = useMutation({
-    mutationFn: async (action: string) => {
-      await fetch(`${API_URL}/api/v1/feedback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ news_id: Number(newsId), action }),
-      })
-    },
+    mutationFn: (action: string) => api.feedback(Number(newsId), action),
     onSettled: () => queryClient.invalidateQueries({ queryKey: queryKeys.profile }),
   })
 
@@ -62,12 +56,14 @@ export function NewsDetailPage() {
             <button
               key={action}
               onClick={() => feedback.mutate(action)}
+              disabled={feedback.isPending}
               className="rounded-full border border-blue-200 bg-white px-4 py-2 hover:bg-[#2563eb] hover:text-white"
             >
               {label}
             </button>
           ))}
         </div>
+        {feedback.error && <p className="mt-3 text-sm text-red-700">{String(feedback.error)}</p>}
         <p className="mt-8 whitespace-pre-wrap text-lg leading-8 text-ink/80">{news.data.content || news.data.snippet}</p>
         <div className="mt-10 rounded-3xl border border-blue-100 bg-blue-50/70 p-5 text-sm text-ink/70">
           <strong className="block text-ink">Оригинал статьи в первоисточнике</strong>

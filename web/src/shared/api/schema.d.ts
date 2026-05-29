@@ -55,6 +55,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/news/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get News Sources */
+        get: operations["get_news_sources_api_v1_news_sources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/news/topics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get News Topics */
+        get: operations["get_news_topics_api_v1_news_topics_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/news/{news_id}": {
         parameters: {
             query?: never;
@@ -661,6 +695,18 @@ export interface components {
             source_name: string;
             /** Title */
             title: string;
+            /**
+             * Url
+             * @default
+             */
+            url: string;
+        };
+        /** DigestAudioStatusResponse */
+        DigestAudioStatusResponse: {
+            /** Status */
+            status: string;
+            /** Detail */
+            detail?: Record<string, never>;
         };
         /** DigestGenerateRequest */
         DigestGenerateRequest: {
@@ -680,14 +726,11 @@ export interface components {
              */
             limit: number;
             /** Digest Style */
-            digest_style: "brief" | "detailed" | "analytical" | "editorial" | null;
-            /**
-             * Topics
-             * @default []
-             */
-            topics: string[];
+            digest_style?: string | null;
+            /** Topics */
+            topics?: string[];
             /** Period Hours */
-            period_hours: number | null;
+            period_hours?: number | null;
             /**
              * Force
              * @default false
@@ -742,6 +785,22 @@ export interface components {
             /** Items */
             items?: components["schemas"]["DigestItemView"][];
         };
+        /** EntityDetailResponse */
+        EntityDetailResponse: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+            /** Type */
+            type: string;
+            /** Normalized Name */
+            normalized_name?: string | null;
+            /** Mention Count */
+            mention_count: number;
+            profile: components["schemas"]["EntityProfileView"];
+            /** Recent News */
+            recent_news?: components["schemas"]["NewsSummary"][];
+        };
         /**
          * EntityPreferenceInput
          * @description User-configurable entity weight.
@@ -763,6 +822,25 @@ export interface components {
             name?: string | null;
             /** Weight */
             weight: number;
+        };
+        /** EntityProfileView */
+        EntityProfileView: {
+            /** Mention Freq Baseline */
+            mention_freq_baseline?: number | null;
+            /** Mention Freq Current */
+            mention_freq_current?: number | null;
+            /**
+             * Source Diversity
+             * @default 0
+             */
+            source_diversity: number;
+            /**
+             * Trend Direction
+             * @default stable
+             */
+            trend_direction: string;
+            /** Last Updated */
+            last_updated?: string | null;
         };
         /** EntitySubscribeRequest */
         EntitySubscribeRequest: {
@@ -993,6 +1071,36 @@ export interface components {
             items: components["schemas"]["NewsSummary"][];
             meta: components["schemas"]["PageMeta"];
         };
+        /** NewsSourceFilterItem */
+        NewsSourceFilterItem: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+            /** Type */
+            type: string;
+            /** Url */
+            url?: string | null;
+            /** Health Status */
+            health_status?: string | null;
+            /** Trust Score */
+            trust_score?: number | null;
+            /**
+             * News Count
+             * @default 0
+             */
+            news_count: number;
+            /**
+             * Processed Count
+             * @default 0
+             */
+            processed_count: number;
+        };
+        /** NewsSourceFiltersResponse */
+        NewsSourceFiltersResponse: {
+            /** Items */
+            items: components["schemas"]["NewsSourceFilterItem"][];
+        };
         /** NewsSummary */
         NewsSummary: {
             /** Id */
@@ -1025,6 +1133,23 @@ export interface components {
             topics?: components["schemas"]["TopicView"][];
             /** Entities */
             entities?: components["schemas"]["EntityView"][];
+        };
+        /** NewsTopicFilterItem */
+        NewsTopicFilterItem: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+            /**
+             * News Count
+             * @default 0
+             */
+            news_count: number;
+        };
+        /** NewsTopicFiltersResponse */
+        NewsTopicFiltersResponse: {
+            /** Items */
+            items: components["schemas"]["NewsTopicFilterItem"][];
         };
         /** PageMeta */
         PageMeta: {
@@ -1276,6 +1401,38 @@ export interface components {
             /** Keyword */
             keyword: string;
         };
+        /** TrendingEntitiesResponse */
+        TrendingEntitiesResponse: {
+            /** Items */
+            items?: components["schemas"]["TrendingEntityItem"][];
+        };
+        /** TrendingEntityItem */
+        TrendingEntityItem: {
+            /** Entity Id */
+            entity_id: number;
+            /** Name */
+            name: string;
+            /** Type */
+            type: string;
+            /** Normalized Name */
+            normalized_name?: string | null;
+            /** Mention Freq Baseline */
+            mention_freq_baseline?: number | null;
+            /** Mention Freq Current */
+            mention_freq_current?: number | null;
+            /**
+             * Source Diversity
+             * @default 0
+             */
+            source_diversity: number;
+            /**
+             * Trend Direction
+             * @default stable
+             */
+            trend_direction: string;
+            /** Last Updated */
+            last_updated?: string | null;
+        };
         /**
          * UserProfilePatch
          * @description Explicit user-facing profile fields.
@@ -1406,6 +1563,46 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_news_sources_api_v1_news_sources_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewsSourceFiltersResponse"];
+                };
+            };
+        };
+    };
+    get_news_topics_api_v1_news_topics_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewsTopicFiltersResponse"];
                 };
             };
         };
@@ -1807,13 +2004,22 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Successful Response */
+            /** @description Digest audio file */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "audio/wav": unknown;
+                };
+            };
+            /** @description Audio generation has not completed yet */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DigestAudioStatusResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1930,7 +2136,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["TrendingEntitiesResponse"];
                 };
             };
             /** @description Validation Error */
@@ -1963,7 +2169,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": Record<string, never>;
+                    "application/json": components["schemas"]["EntityDetailResponse"];
                 };
             };
             /** @description Validation Error */

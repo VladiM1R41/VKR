@@ -1,4 +1,5 @@
 export const queryKeys = {
+  feedRoot: ['news', 'feed'] as const,
   feed: (filters?: unknown) => ['news', 'feed', filters] as const,
   sources: ['news', 'sources'] as const,
   topics: ['news', 'topics'] as const,
