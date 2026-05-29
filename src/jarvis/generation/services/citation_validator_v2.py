@@ -24,11 +24,21 @@ _KNOWN_SOURCES = {
     "банк россии",
     "цб",
 }
+_NON_SOURCE_ACRONYMS = {
+    "ai",
+    "асду",
+    "cpu",
+    "gpu",
+    "iiot",
+    "iot",
+    "llm",
+    "mws ai",
+}
 
 _PREFIX_PATTERNS = [
     re.compile(rf"(?:по\s+данным|по\s+информации|согласно)\s+({_SOURCE_TOKEN})(?=[,.;:!?]|$)", re.IGNORECASE),
     re.compile(rf"как\s+(?:сообщает|пишет)\s+({_SOURCE_TOKEN})(?=[,.;:!?]|$)", re.IGNORECASE),
-    re.compile(rf"источник[:\s]+({_SOURCE_TOKEN})(?=[,.;:!?]|$)", re.IGNORECASE),
+    re.compile(rf"источники?[:\s]+({_SOURCE_TOKEN})(?=[,.;:!?]|$)", re.IGNORECASE),
 ]
 _POSTFIX_PATTERNS = [
     re.compile(rf"({_SOURCE_TOKEN})\s+(?:сообщает|пишет)\b", re.IGNORECASE),
@@ -37,6 +47,10 @@ _POSTFIX_PATTERNS = [
 _DOC_REF_RE = re.compile(r"\[\s*doc\s+(\d+)\s*\]", re.IGNORECASE)
 _PAREN_WITH_DOC_RE = re.compile(r"\(([^()]*\[\s*doc\s+\d+\s*\][^()]*)\)", re.IGNORECASE)
 _ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_SOURCES_BLOCK_RE = re.compile(
+    r"(?:^|\n)\s*(?:#{1,6}\s*)?\**источники?\**\s*:\s*\n*(.+?)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,12 +155,34 @@ class CitationValidator:
                 if source:
                     self._append_source(sources, seen, source)
 
+        for source in self._extract_sources_block(text):
+            self._append_source(sources, seen, source)
+
         for pattern in _PREFIX_PATTERNS + _POSTFIX_PATTERNS:
             for match in pattern.finditer(text):
                 source = self._clean_source_candidate(match.group(1))
                 self._append_source(sources, seen, source)
 
         return sources
+
+    def _extract_sources_block(self, text: str) -> list[str]:
+        """Extract human-readable source names from a final "Источники:" block."""
+        result: list[str] = []
+        for match in _SOURCES_BLOCK_RE.finditer(text):
+            block = match.group(1)
+            for raw_line in block.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line)
+                line = re.sub(r"https?://\S+", "", line).strip()
+                candidate = re.split(r"\s+[—–-]\s+", line, maxsplit=1)[0]
+                candidate = re.split(r"\.\s+[\"«“]", candidate, maxsplit=1)[0]
+                candidate = re.split(r":\s+[\"«“]", candidate, maxsplit=1)[0]
+                candidate = self._clean_source_candidate(candidate)
+                if candidate:
+                    result.append(candidate)
+        return result
 
     def _append_source(
         self,
@@ -172,19 +208,34 @@ class CitationValidator:
             return False
 
         lowered = cleaned.lower()
-        if lowered in {"как", "по", "согласно", "источник"}:
+        if lowered in {"как", "по", "согласно", "источник", "об этом"}:
             return False
         if "." in cleaned:
             return True
         if lowered in _KNOWN_SOURCES:
             return True
+        if lowered in _NON_SOURCE_ACRONYMS:
+            return False
+
+        tokens = cleaned.split()
+        if tokens and all(self._is_short_acronym(token) for token in tokens):
+            return False
+
         if any(ch.isupper() for ch in cleaned):
             return True
         return False
 
     @staticmethod
+    def _is_short_acronym(value: str) -> bool:
+        letters = [ch for ch in value if ch.isalpha()]
+        if not letters or len(letters) > 6:
+            return False
+        return all(ch.upper() == ch for ch in letters)
+
+    @staticmethod
     def _clean_source_candidate(value: str) -> str:
         cleaned = re.sub(r"\s+", " ", value).strip()
+        cleaned = re.sub(r"^(?:а|и|но)\s+", "", cleaned, flags=re.IGNORECASE)
         return _TRAILING_PUNCT_RE.sub("", cleaned)
 
     @staticmethod

@@ -10,7 +10,10 @@ from pydantic import BaseModel, Field
 class DigestGenerateRequest(BaseModel):
     digest_type: str = Field("on_demand", pattern="^(morning|evening|weekly|on_demand)$")
     query: str = Field("главные новости сегодня", min_length=1, max_length=500)
-    limit: int = Field(20, ge=3, le=50)
+    limit: int = Field(40, ge=10, le=50)
+    digest_style: str | None = Field(None, pattern="^(brief|detailed|analytical|editorial)$")
+    topics: list[str] = Field(default_factory=list)
+    period_hours: int | None = Field(None, ge=1, le=24 * 30)
     force: bool = False
 
 
@@ -39,3 +42,8 @@ class DigestListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class DigestAudioStatusResponse(BaseModel):
+    status: str
+    detail: dict = Field(default_factory=dict)

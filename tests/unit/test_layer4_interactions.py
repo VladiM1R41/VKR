@@ -125,3 +125,32 @@ def test_log_interaction_rejects_unknown_search_log() -> None:
             session,
             InteractionEventRequest(user_id=1, news_id=2, action="click", search_log_id=99),
         )
+
+
+def test_log_interaction_can_defer_commit() -> None:
+    history = FakeSeenHistory()
+    service = InteractionLoggingService(seen_history=history)
+    session = Mock()
+
+    user = User(id=1, username="alice", settings={}, created_at=datetime.now(UTC))
+    news = News(id=2, source_id=1, title="x", canonical_url="u", published_at=datetime.now(UTC))
+
+    def fake_get(model, key):
+        if model.__name__ == "User" and key == 1:
+            return user
+        if model.__name__ == "News" and key == 2:
+            return news
+        return None
+
+    session.get.side_effect = fake_get
+    session.refresh.side_effect = lambda obj: setattr(obj, "id", 56) or setattr(obj, "created_at", datetime.now(UTC))
+
+    result = service.log_interaction(
+        session,
+        InteractionEventRequest(user_id=1, news_id=2, action="like"),
+        commit=False,
+    )
+
+    assert result.interaction_id == 56
+    session.flush.assert_called_once()
+    session.commit.assert_not_called()

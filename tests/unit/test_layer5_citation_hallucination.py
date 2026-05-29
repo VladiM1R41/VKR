@@ -70,6 +70,55 @@ class TestCitationValidatorValid:
 
         assert result.is_valid is True
 
+    def test_sources_block_at_end_is_valid(self):
+        """Человеческий блок источников в конце ответа распознаётся."""
+        validator = CitationValidator()
+        answer = (
+            "Трамп призвал ряд стран присоединиться к соглашениям с Израилем.\n\n"
+            "Источники:\n"
+            "1. РБК — Axios узнал о призыве Трампа — https://example.test/rbc\n"
+            "2. Коммерсантъ news — Axios: Трамп просил лидеров — https://example.test/kommersant\n"
+        )
+        docs = [
+            {"source": "РБК", "news_id": 1},
+            {"source": "Коммерсантъ news", "news_id": 2},
+        ]
+
+        result = validator.validate(answer, docs)
+
+        assert result.is_valid is True
+        assert result.total_citations == 2
+        assert result.valid_citations == ["РБК", "Коммерсантъ news"]
+
+    def test_sources_block_with_period_before_title_is_valid(self):
+        validator = CitationValidator()
+        answer = (
+            "Короткий обзор по материалам дня.\n\n"
+            "Источники:\n"
+            "1. RIA Novosti. \"Main event title.\" https://example.test/ria\n"
+        )
+        docs = [{"source": "RIA Novosti", "news_id": 1}]
+
+        result = validator.validate(answer, docs)
+
+        assert result.is_valid is True
+        assert result.valid_citations == ["RIA Novosti"]
+
+    def test_technical_acronyms_in_parentheses_are_not_sources(self):
+        validator = CitationValidator()
+        answer = (
+            "Компании внедряют интернет вещей (IIoT), платформы MWS AI и графические процессоры (GPU). "
+            "Система диспетчерского управления (АСДУ) помогает дата-центрам.\n\n"
+            "Источники:\n"
+            "1. CNews — Главная технологическая новость — https://example.test/cnews\n"
+        )
+        docs = [{"source": "CNews", "news_id": 1}]
+
+        result = validator.validate(answer, docs)
+
+        assert result.is_valid is True
+        assert result.valid_citations == ["CNews"]
+
 
 class TestCitationValidatorInvalid:
     """Тесты невалидных цитат."""

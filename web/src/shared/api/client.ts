@@ -4,6 +4,28 @@ import type { paths } from './schema'
 export const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 export const openapiClient = createClient<paths>({ baseUrl: API_URL })
 
+async function responseErrorMessage(response: Response): Promise<string> {
+  const text = await response.text()
+  if (!text) return `HTTP ${response.status}`
+  try {
+    const data = JSON.parse(text) as { detail?: unknown; message?: unknown }
+    if (typeof data.detail === 'string') return data.detail
+    if (Array.isArray(data.detail)) {
+      return data.detail
+        .map((item) => {
+          if (typeof item === 'string') return item
+          if (item && typeof item === 'object' && 'msg' in item) return String(item.msg)
+          return JSON.stringify(item)
+        })
+        .join('; ')
+    }
+    if (typeof data.message === 'string') return data.message
+  } catch {
+    // Plain-text responses are shown as-is.
+  }
+  return text
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
     headers: {
@@ -13,8 +35,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   })
   if (!response.ok) {
-    const text = await response.text()
-    throw new Error(text || `HTTP ${response.status}`)
+    throw new Error(await responseErrorMessage(response))
   }
   return response.json() as Promise<T>
 }
@@ -93,7 +114,7 @@ export type ChatResponse = {
   rag_mode: string
   model_name: string
   generation_log_id?: number
-  sources: Array<{ news_id: number; source_name: string; title: string }>
+  sources: Array<{ news_id: number; source_name: string; title: string; url?: string | null }>
 }
 export type DigestResponse = {
   id: number
@@ -173,6 +194,14 @@ export const api = {
     }),
   chatSessions: () => request<{ items: Array<{ id: number; title?: string; message_count: number }> }>('/api/v1/chat/sessions'),
   chatMessages: (id: string | number) => request<{ messages: Array<{ role: string; content: string }> }>(`/api/v1/chat/sessions/${id}/messages`),
+  feedback: (newsId: number, action: string) =>
+    request<{ recorded: boolean; interaction_id: number; stored_action: string; derived_signal: number }>(
+      '/api/v1/feedback',
+      {
+        method: 'POST',
+        body: JSON.stringify({ news_id: newsId, action }),
+      },
+    ),
   profile: () => request<ProfileResponse>('/api/v1/profile'),
   updateProfile: (payload: PreferencePayload) =>
     request<ProfileResponse>('/api/v1/profile/preferences', {
@@ -181,10 +210,16 @@ export const api = {
     }),
   interactions: () => request<any>('/api/v1/profile/interactions?limit=12'),
   digest: () => request<DigestResponse>('/api/v1/digest'),
-  generateDigest: (query?: string) =>
+  generateDigest: (query?: string, topics: string[] = [], periodHours?: number) =>
     request<DigestResponse>('/api/v1/digest/generate', {
       method: 'POST',
-      body: JSON.stringify({ force: true, query: query || 'главные новости сегодня' }),
+      body: JSON.stringify({
+        force: true,
+        query: query || 'главные новости сегодня',
+        topics,
+        period_hours: periodHours,
+        digest_style: 'editorial',
+      }),
     }),
   adminOverview: () => request<any>('/api/v1/admin/overview'),
   adminSources: () => request<any>('/api/v1/admin/sources'),

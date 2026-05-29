@@ -75,6 +75,13 @@ def _resolve_cluster_source_count(session, news: News) -> int:
     return int(fallback_count)
 
 
+def _resolve_cluster_article_count(session, cluster_id: int) -> int:
+    return int(
+        session.scalar(select(func.count(News.id)).where(News.event_cluster_id == cluster_id))
+        or 0
+    )
+
+
 def _ensure_topics(session, topic_matches: list[TopicMatch]) -> dict[str, Topic]:
     if not topic_matches:
         return {}
@@ -297,9 +304,15 @@ def process_one_news_article(
     """Process one article into PostgreSQL side tables and Qdrant retrieval points."""
 
     t_start = time.monotonic()
+    timings: dict[str, float] = {}
+
+    def record_timing(name: str, stage_start: float) -> None:
+        timings[name] = round(time.monotonic() - stage_start, 3)
+
     indexer = qdrant_indexer or QdrantIndexer()
 
     with SyncSessionLocal() as session:
+        stage_start = time.monotonic()
         news = session.get(News, news_id)
         if news is None:
             return ProcessArticleResult(news_id, "not_found", 0, 0, 0, 0)
@@ -310,17 +323,27 @@ def process_one_news_article(
         reliability = source.reliability if source is not None else "C"
         trust_score = source.trust_score if source is not None else 0.5
         source_name = source.name if source is not None else "Unknown"
+        record_timing("load_article", stage_start)
 
         entity_text = _build_entity_text(news)
+        stage_start = time.monotonic()
         extracted_entities = extract_entities(entity_text)
+        record_timing("extract_entities", stage_start)
+
+        stage_start = time.monotonic()
         topic_matches = resolve_topics(
             source_categories=_extract_source_categories(news),
             title=news.title,
             body=news.content or "",
         )
+        record_timing("resolve_topics", stage_start)
+
+        stage_start = time.monotonic()
         keyword_results = extract_keywords(entity_text)
         keyword_texts = [kw.text for kw in keyword_results]
+        record_timing("extract_keywords", stage_start)
 
+        stage_start = time.monotonic()
         lemma_title = lemmatize_text(news.title)
         has_full_content = bool((news.content or "").strip())
         lemma_body = ""
@@ -332,7 +355,9 @@ def process_one_news_article(
             )
             keyword_results = extract_keywords(fallback_text)
             keyword_texts = [kw.text for kw in keyword_results]
+        record_timing("prepare_text", stage_start)
 
+        stage_start = time.monotonic()
         prepared_chunks = build_chunks(
             title=news.title,
             body=news.content,
@@ -348,13 +373,16 @@ def process_one_news_article(
                 lemma_title=lemma_title,
                 lemma_body="",
             )
+        record_timing("build_chunks", stage_start)
 
+        stage_start = time.monotonic()
         encoded_chunks = encode_texts(
             [chunk.text for chunk in prepared_chunks],
             sparse_texts=[chunk.lemma_text or chunk.text for chunk in prepared_chunks],
         )
         if len(encoded_chunks) != len(prepared_chunks):
             raise RuntimeError("Embedding runtime returned an unexpected number of vectors.")
+        record_timing("encode_chunks", stage_start)
 
         representative_vector = next(
             (
@@ -365,7 +393,9 @@ def process_one_news_article(
             encoded_chunks[0].dense_vector if encoded_chunks else None,
         )
         old_cluster_id = news.event_cluster_id or news.id
+        stage_start = time.monotonic()
         resolved_cluster_id = resolve_event_cluster_id(news, current_dense_vector=representative_vector)
+        record_timing("resolve_event_cluster", stage_start)
         news.event_cluster_id = resolved_cluster_id
         session.flush()
 
@@ -380,6 +410,7 @@ def process_one_news_article(
             )
 
         cluster_source_count = _resolve_cluster_source_count(session, news)
+        cluster_article_count = _resolve_cluster_article_count(session, news.event_cluster_id or news.id)
         news.content_grade = derive_content_grade(
             reliability=reliability,
             cluster_source_count=cluster_source_count,
@@ -444,11 +475,17 @@ def process_one_news_article(
                 )
             )
 
+        stage_start = time.monotonic()
         indexer.ensure_collection()
+        record_timing("qdrant_ensure_collection", stage_start)
+
+        stage_start = time.monotonic()
         indexer.upsert_chunks(indexed_chunks)
+        record_timing("qdrant_upsert_chunks", stage_start)
         new_point_ids = [chunk.point_id for chunk in indexed_chunks]
 
         try:
+            stage_start = time.monotonic()
             old_entity_ids = _load_existing_entity_ids(session, news.id)
             if old_entity_ids:
                 decrement_cooccurrences(session, build_cooccurrence_edges(old_entity_ids))
@@ -485,6 +522,7 @@ def process_one_news_article(
             news.processed = True
             processed_at = datetime.now(timezone.utc).isoformat()
             processing_seconds = round(time.monotonic() - t_start, 3)
+            record_timing("db_persist", stage_start)
             extra = dict(news.extra or {})
             extra["processing"] = {
                 "status": "processed",
@@ -497,11 +535,13 @@ def process_one_news_article(
                 "entity_count": entity_count,
                 "cooccurrence_edges": coocc_count,
                 "cluster_source_count": cluster_source_count,
+                "cluster_article_count": cluster_article_count,
                 "value_score": value_score,
                 "freshness": freshness,
                 "completeness": completeness,
                 "cluster_support": cluster_support,
                 "fallback_body_used": not has_full_content and bool((news.snippet_lead or "").strip()),
+                "timings": dict(timings),
             }
             news.extra = extra
 
@@ -515,6 +555,7 @@ def process_one_news_article(
 
         if new_point_ids:
             try:
+                stage_start = time.monotonic()
                 indexer.update_payload(
                     new_point_ids,
                     {
@@ -530,6 +571,7 @@ def process_one_news_article(
                         "nlp_enriched": nlp_enriched,
                     },
                 )
+                record_timing("qdrant_update_payload", stage_start)
             except Exception:
                 log_event(
                     logger,
@@ -539,27 +581,39 @@ def process_one_news_article(
                     point_count=len(new_point_ids),
                 )
 
+            if existing_point_ids:
+                try:
+                    stage_start = time.monotonic()
+                    indexer.delete_stale_points_for_news(news.id, keep_point_ids=set(new_point_ids))
+                    record_timing("qdrant_stale_cleanup", stage_start)
+                except Exception:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "processing_stale_points_cleanup_failed",
+                        news_id=news.id,
+                    )
+            else:
+                timings["qdrant_stale_cleanup"] = 0.0
+
+        cluster_id = news.event_cluster_id or news.id
+        if cluster_article_count > 1:
             try:
-                indexer.delete_stale_points_for_news(news.id, keep_point_ids=set(new_point_ids))
+                stage_start = time.monotonic()
+                _refresh_cluster_grade_payloads(cluster_id, indexer)
+                record_timing("cluster_grade_refresh", stage_start)
             except Exception:
                 log_event(
                     logger,
                     logging.WARNING,
-                    "processing_stale_points_cleanup_failed",
+                    "processing_cluster_grade_refresh_failed",
                     news_id=news.id,
+                    cluster_id=cluster_id,
                 )
+        else:
+            timings["cluster_grade_refresh"] = 0.0
 
-        try:
-            _refresh_cluster_grade_payloads(news.event_cluster_id or news.id, indexer)
-        except Exception:
-            log_event(
-                logger,
-                logging.WARNING,
-                "processing_cluster_grade_refresh_failed",
-                news_id=news.id,
-                cluster_id=news.event_cluster_id or news.id,
-            )
-
+        timings["total"] = round(time.monotonic() - t_start, 3)
         log_event(
             logger,
             logging.INFO,
@@ -571,6 +625,7 @@ def process_one_news_article(
             cooccurrence_edges=coocc_count,
             content_grade=news.content_grade,
             is_uncertain=news.is_uncertain,
+            processing_timings=timings,
         )
         return ProcessArticleResult(
             news_id=news.id,

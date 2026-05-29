@@ -17,6 +17,7 @@ from jarvis.core.logging import log_event
 from jarvis.db.models import TermVocabulary
 from jarvis.db.session import SyncSessionLocal
 from jarvis.processing.ir.lemmatize import lemmatize_text
+from jarvis.processing.ir.quality_terms import is_informative_term
 
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,7 @@ def _load_vocabulary() -> dict[str, int]:
         vocabulary = {
             term.lower(): int(df)
             for term, df in rows
-            if term and df > 0 and len(term) >= _MIN_TERM_LENGTH
+            if term and df > 0 and len(term) >= _MIN_TERM_LENGTH and is_informative_term(term)
         }
     _vocabulary_cache["loaded_at"] = now
     _vocabulary_cache["value"] = vocabulary
@@ -134,6 +135,8 @@ def _should_skip_word(word: str) -> bool:
     if len(stripped) < _MIN_TERM_LENGTH:
         return True
     if not _TOKEN_RE.match(stripped):
+        return True
+    if not is_informative_term(stripped):
         return True
     if stripped.isupper():
         return True

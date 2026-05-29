@@ -29,8 +29,8 @@ def feedback(
             search_log_id=request.search_log_id,
             session_id=request.session_id,
         )
-        response = InteractionLoggingService().log_interaction(session, event)
-        ProfileUpdateService().update_from_interaction(session, response.interaction_id)
+        response = InteractionLoggingService().log_interaction(session, event, commit=False)
+        ProfileUpdateService().update_from_interaction(session, response.interaction_id, commit=False)
         session.commit()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -41,4 +41,3 @@ def feedback(
         stored_action=response.stored_action,
         derived_signal=response.derived_signal,
     )
-

@@ -65,6 +65,7 @@ async def _run_chat_answer(
             information_type=item.get("information_type", "daily"),
             urgency=item.get("urgency", "normal"),
             event_cluster_id=item.get("event_cluster_id"),
+            url=item.get("url", ""),
         )
         for item in news_items_data
     ]
@@ -91,6 +92,7 @@ async def _run_chat_answer(
                     "news_id": s.news_id,
                     "source_name": s.source_name,
                     "title": s.title,
+                    "url": s.url,
                 }
                 for s in result.sources
             ],

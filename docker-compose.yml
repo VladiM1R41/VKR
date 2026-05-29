@@ -1,4 +1,3 @@
-# Джарвис — Слой 0: Инфраструктура
 # Запуск: docker compose up -d
 # Остановка: docker compose down
 # Просмотр логов: docker compose logs -f

@@ -15,6 +15,7 @@ from jarvis.core.settings import get_settings
 from jarvis.db.models import Collocation, News, TermVocabulary
 from jarvis.db.session import SyncSessionLocal
 from jarvis.processing.ir.lemmatize import extract_bigrams, extract_unigrams
+from jarvis.processing.ir.quality_terms import is_informative_bigram, is_informative_term
 
 
 logger = logging.getLogger(__name__)
@@ -65,14 +66,26 @@ def _collect_processed_texts() -> list[str]:
     return texts
 
 
+def _filter_unigrams(terms: list[str]) -> list[str]:
+    """Keep only terms useful for corpus vocabulary analytics."""
+
+    return [term for term in terms if is_informative_term(term)]
+
+
+def _filter_bigrams(bigrams: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep only bigrams useful for query expansion and corpus analytics."""
+
+    return [(a, b) for a, b in bigrams if is_informative_bigram(a, b)]
+
+
 def _collect_corpus_lemmas() -> tuple[list[str], list[tuple[str, str]]]:
     """Collect all unigrams and bigrams from the configured processed corpus window."""
 
     all_unigrams: list[str] = []
     all_bigrams: list[tuple[str, str]] = []
     for text in _collect_processed_texts():
-        all_unigrams.extend(extract_unigrams(text))
-        all_bigrams.extend(extract_bigrams(text))
+        all_unigrams.extend(_filter_unigrams(extract_unigrams(text)))
+        all_bigrams.extend(_filter_bigrams(extract_bigrams(text)))
     return all_unigrams, all_bigrams
 
 
@@ -93,34 +106,30 @@ def update_term_vocabulary() -> VocabularyUpdateResult:
     import time
 
     t0 = time.time()
-    documents = [extract_unigrams(text) for text in _collect_processed_texts()]
+    documents = [_filter_unigrams(extract_unigrams(text)) for text in _collect_processed_texts()]
     documents = [terms for terms in documents if terms]
     if not documents:
         return VocabularyUpdateResult()
 
     doc_counter, collection_counter = _count_term_frequencies(documents)
     result = VocabularyUpdateResult(elapsed_seconds=0.0)
+    eligible_terms = [
+        (term, coll_freq)
+        for term, coll_freq in collection_counter.items()
+        if coll_freq >= _MIN_TERM_FREQUENCY and is_informative_term(term)
+    ]
 
     with SyncSessionLocal() as session:
-        for term, coll_freq in collection_counter.items():
-            if coll_freq < _MIN_TERM_FREQUENCY:
-                continue
-
-            existing = session.get(TermVocabulary, term)
-            if existing:
-                existing.doc_frequency = doc_counter.get(term, 0)
-                existing.collection_frequency = coll_freq
-                existing.updated_at = datetime.now(timezone.utc)
-                result.terms_updated += 1
-            else:
-                session.add(
-                    TermVocabulary(
-                        term=term,
-                        doc_frequency=doc_counter.get(term, 0),
-                        collection_frequency=coll_freq,
-                    )
+        session.query(TermVocabulary).delete(synchronize_session=False)
+        for term, coll_freq in eligible_terms:
+            session.add(
+                TermVocabulary(
+                    term=term,
+                    doc_frequency=doc_counter.get(term, 0),
+                    collection_frequency=coll_freq,
                 )
-                result.terms_added += 1
+            )
+            result.terms_added += 1
 
         session.commit()
 
@@ -157,38 +166,36 @@ def update_collocations() -> CollocationUpdateResult:
     total_bigrams = sum(bigram_counter.values())
     total_unigrams = sum(unigram_counter.values())
     result = CollocationUpdateResult(elapsed_seconds=0.0)
+    eligible_collocations: list[tuple[str, str, float, int]] = []
+
+    for (term_a, term_b), freq in bigram_counter.items():
+        if freq < _MIN_BIGRAM_FREQUENCY or not is_informative_bigram(term_a, term_b):
+            continue
+
+        p_joint = freq / total_bigrams
+        p_a = unigram_counter.get(term_a, 0) / total_unigrams
+        p_b = unigram_counter.get(term_b, 0) / total_unigrams
+        if p_a == 0 or p_b == 0:
+            continue
+
+        pmi = log(p_joint / (p_a * p_b))
+        if pmi < _MIN_PMI_SCORE:
+            continue
+
+        eligible_collocations.append((term_a, term_b, round(pmi, 4), freq))
 
     with SyncSessionLocal() as session:
-        for (term_a, term_b), freq in bigram_counter.items():
-            if freq < _MIN_BIGRAM_FREQUENCY:
-                continue
-
-            p_joint = freq / total_bigrams
-            p_a = unigram_counter.get(term_a, 0) / total_unigrams
-            p_b = unigram_counter.get(term_b, 0) / total_unigrams
-            if p_a == 0 or p_b == 0:
-                continue
-
-            pmi = log(p_joint / (p_a * p_b))
-            if pmi < _MIN_PMI_SCORE:
-                continue
-
-            existing = session.get(Collocation, {"term_a": term_a, "term_b": term_b})
-            if existing:
-                existing.pmi_score = round(pmi, 4)
-                existing.frequency = freq
-                existing.updated_at = datetime.now(timezone.utc)
-                result.collocations_updated += 1
-            else:
-                session.add(
-                    Collocation(
-                        term_a=term_a,
-                        term_b=term_b,
-                        pmi_score=round(pmi, 4),
-                        frequency=freq,
-                    )
+        session.query(Collocation).delete(synchronize_session=False)
+        for term_a, term_b, pmi, freq in eligible_collocations:
+            session.add(
+                Collocation(
+                    term_a=term_a,
+                    term_b=term_b,
+                    pmi_score=pmi,
+                    frequency=freq,
                 )
-                result.collocations_added += 1
+            )
+            result.collocations_added += 1
 
         session.commit()
 

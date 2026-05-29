@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router'
 
 import { api } from '../shared/api/client'
+import type { ChatResponse } from '../shared/api/client'
 import { queryKeys } from '../shared/api/queryKeys'
 import { ErrorBlock } from '../shared/ui/State'
 
@@ -15,7 +16,7 @@ function displaySessionTitle(title: string | undefined, id: number): string {
 export function ChatPage() {
   const { sessionId } = useParams()
   const [message, setMessage] = useState('')
-  const [answer, setAnswer] = useState('')
+  const [lastResponse, setLastResponse] = useState<ChatResponse | null>(null)
   const queryClient = useQueryClient()
   const sessions = useQuery({ queryKey: queryKeys.chatSessions, queryFn: api.chatSessions })
   const messages = useQuery({
@@ -26,7 +27,7 @@ export function ChatPage() {
   const chat = useMutation({
     mutationFn: () => api.chat(message, sessionId ? Number(sessionId) : undefined),
     onSuccess: (data) => {
-      setAnswer(data.answer)
+      setLastResponse(data)
       setMessage('')
       queryClient.invalidateQueries({ queryKey: queryKeys.chatSessions })
       if (data.session_id) queryClient.invalidateQueries({ queryKey: queryKeys.chatMessages(data.session_id) })
@@ -59,10 +60,43 @@ export function ChatPage() {
             <p className="whitespace-pre-wrap">{item.content}</p>
           </div>
         ))}
-        {answer && (
+        {lastResponse && (
           <div className="mt-5 rounded-3xl border border-blue-100 bg-white p-5">
             <div className="label mb-2">Последний ответ</div>
-            <p className="whitespace-pre-wrap leading-7">{answer}</p>
+            <p className="whitespace-pre-wrap leading-7">{lastResponse.answer}</p>
+            {!!lastResponse.sources.length && (
+              <div className="mt-5">
+                <div className="label mb-2">Источники ответа</div>
+                <div className="flex flex-wrap gap-2">
+                  {lastResponse.sources.slice(0, 8).map((source, index) => {
+                    const label = `${index + 1}. ${source.source_name}: ${source.title}`
+                    const className =
+                      'max-w-[320px] truncate rounded-full border border-blue-100 bg-blue-50 px-3 py-2 text-sm font-semibold text-[#1d4ed8] hover:border-[#2563eb] hover:bg-white'
+                    return source.url ? (
+                      <a
+                        key={`${source.news_id}-${index}`}
+                        href={source.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={label}
+                        className={className}
+                      >
+                        {label}
+                      </a>
+                    ) : (
+                      <Link
+                        key={`${source.news_id}-${index}`}
+                        to={`/news/${source.news_id}`}
+                        title={label}
+                        className={className}
+                      >
+                        {label}
+                      </Link>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         )}
         {chat.error && (

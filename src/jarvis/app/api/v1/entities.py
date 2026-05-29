@@ -9,6 +9,12 @@ from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session
 
 from jarvis.app.dependencies import get_current_user_id, get_db
+from jarvis.app.schemas.entities import (
+    EntityDetailResponse,
+    EntityProfileView,
+    TrendingEntitiesResponse,
+    TrendingEntityItem,
+)
 from jarvis.app.schemas.news import NewsSummary
 from jarvis.app.schemas.profile import EntitySubscribeRequest, EntitySubscribeResponse
 from jarvis.db.models import Entity, EntityProfile, News, NewsEntity, Source, UserEntitySubscription
@@ -17,12 +23,12 @@ from jarvis.app.api.v1.news import _load_entities, _load_topics, _summary
 router = APIRouter()
 
 
-@router.get("/trending")
+@router.get("/trending", response_model=TrendingEntitiesResponse)
 def trending_entities(
     session: Session = Depends(get_db),
     limit: int = Query(10, ge=1, le=100),
     period_hours: int = Query(24, ge=1, le=168),
-) -> dict:
+) -> TrendingEntitiesResponse:
     since = datetime.now(UTC) - timedelta(hours=period_hours)
     rows = session.execute(
         select(Entity, EntityProfile)
@@ -36,30 +42,30 @@ def trending_entities(
         .order_by(desc(EntityProfile.mention_freq_current - EntityProfile.mention_freq_baseline))
         .limit(limit)
     ).all()
-    return {
-        "items": [
-            {
-                "entity_id": entity.id,
-                "name": entity.name,
-                "type": entity.type,
-                "normalized_name": entity.normalized_name,
-                "mention_freq_baseline": profile.mention_freq_baseline,
-                "mention_freq_current": profile.mention_freq_current,
-                "source_diversity": profile.source_diversity,
-                "trend_direction": profile.trend_direction,
-                "last_updated": profile.last_updated,
-            }
+    return TrendingEntitiesResponse(
+        items=[
+            TrendingEntityItem(
+                entity_id=entity.id,
+                name=entity.name,
+                type=entity.type,
+                normalized_name=entity.normalized_name,
+                mention_freq_baseline=profile.mention_freq_baseline,
+                mention_freq_current=profile.mention_freq_current,
+                source_diversity=profile.source_diversity,
+                trend_direction=profile.trend_direction,
+                last_updated=profile.last_updated,
+            )
             for entity, profile in rows
         ]
-    }
+    )
 
 
-@router.get("/{entity_id}")
+@router.get("/{entity_id}", response_model=EntityDetailResponse)
 def entity_detail(
     entity_id: int,
     session: Session = Depends(get_db),
     limit: int = Query(5, ge=1, le=20),
-) -> dict:
+) -> EntityDetailResponse:
     entity = session.get(Entity, entity_id)
     if entity is None:
         raise HTTPException(status_code=404, detail="Entity not found")
@@ -79,21 +85,21 @@ def entity_detail(
         _summary(news, source, topics.get(news.id, []), entities.get(news.id, []))
         for news, source in rows
     ]
-    return {
-        "id": entity.id,
-        "name": entity.name,
-        "type": entity.type,
-        "normalized_name": entity.normalized_name,
-        "mention_count": entity.mention_count,
-        "profile": {
-            "mention_freq_baseline": profile.mention_freq_baseline if profile else None,
-            "mention_freq_current": profile.mention_freq_current if profile else None,
-            "source_diversity": profile.source_diversity if profile else 0,
-            "trend_direction": profile.trend_direction if profile else "stable",
-            "last_updated": profile.last_updated if profile else None,
-        },
-        "recent_news": [item.model_dump(mode="json") for item in recent_news],
-    }
+    return EntityDetailResponse(
+        id=entity.id,
+        name=entity.name,
+        type=entity.type,
+        normalized_name=entity.normalized_name,
+        mention_count=entity.mention_count,
+        profile=EntityProfileView(
+            mention_freq_baseline=profile.mention_freq_baseline if profile else None,
+            mention_freq_current=profile.mention_freq_current if profile else None,
+            source_diversity=profile.source_diversity if profile else 0,
+            trend_direction=profile.trend_direction if profile else "stable",
+            last_updated=profile.last_updated if profile else None,
+        ),
+        recent_news=recent_news,
+    )
 
 
 @router.post("/{entity_id}/subscribe", response_model=EntitySubscribeResponse)

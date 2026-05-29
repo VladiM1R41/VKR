@@ -158,3 +158,15 @@ def test_update_from_interaction_does_not_overwrite_explicit_topic_or_entity_wei
     assert session.topic_weights[(1, 101)].weight == 0.9
     assert session.topic_weights[(1, 102)].weight == 0.625
     assert session.entity_weights[(1, 201)].weight == 0.9
+
+
+def test_update_from_interaction_can_defer_commit() -> None:
+    session = FakeSession()
+    store = FakeSessionProfileStore()
+    service = ProfileUpdateService(session_store=store, alpha=0.25)
+
+    result = service.update_from_interaction(session, 10, commit=False)
+
+    assert result.updated_topics == 2
+    assert result.updated_entities == 1
+    assert session.committed is False

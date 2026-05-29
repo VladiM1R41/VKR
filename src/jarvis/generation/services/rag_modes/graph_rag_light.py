@@ -120,6 +120,7 @@ class GraphRAGLightService:
                     information_type=str(news.information_type or "daily"),
                     urgency=str(news.urgency or "normal"),
                     event_cluster_id=getattr(news, "event_cluster_id", None),
+                    url=str(news.url or ""),
                 )
             )
         return result

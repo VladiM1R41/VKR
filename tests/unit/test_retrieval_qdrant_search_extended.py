@@ -1,6 +1,6 @@
 """Extended tests for Layer 3 Qdrant search service."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 import sys
 import types
 
@@ -23,6 +23,11 @@ class TestQdrantSearchServiceExtended:
                     self.any = any
 
             class Range:
+                def __init__(self, gte=None, lte=None):
+                    self.gte = gte
+                    self.lte = lte
+
+            class DatetimeRange:
                 def __init__(self, gte=None, lte=None):
                     self.gte = gte
                     self.lte = lte
@@ -94,11 +99,13 @@ class TestQdrantSearchServiceExtended:
         fake_client = FakeClient()
         monkeypatch.setattr(service, "_client", lambda: fake_client)
 
+        date_from = datetime(2026, 4, 14, tzinfo=UTC)
         results = service.search(
             dense_vector=[0.1, 0.2],
             sparse_indices=[1, 2],
             sparse_values=[0.4, 0.6],
             limit=5,
+            date_from=date_from,
             topics=["economy"],
             additional_queries=[([0.3, 0.4], [5], [0.9])],
         )
@@ -107,7 +114,9 @@ class TestQdrantSearchServiceExtended:
         call = fake_client.calls[0]
         assert call["collection_name"] == service._settings.qdrant_collection_alias
         assert len(call["prefetch"]) == 4
-        assert len(call["query_filter"].must) == 2
+        assert len(call["query_filter"].must) == 3
+        assert call["query_filter"].must[1].key == "published_at"
+        assert call["query_filter"].must[1].range.gte == date_from
 
         assert len(results) == 1
         assert results[0].title == "Fallback title"

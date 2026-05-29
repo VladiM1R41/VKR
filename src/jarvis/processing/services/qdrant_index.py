@@ -29,11 +29,15 @@ class QdrantIndexer:
 
     def __init__(self) -> None:
         self._settings = get_settings()
+        self._client_instance: Any | None = None
+        self._ensured_collections: set[str] = set()
 
     def _client(self):
         from qdrant_client import QdrantClient
 
-        return QdrantClient(url=self._settings.qdrant_url)
+        if self._client_instance is None:
+            self._client_instance = QdrantClient(url=self._settings.qdrant_url)
+        return self._client_instance
 
     def ensure_collection(self) -> None:
         self._ensure_collection_named(self._settings.qdrant_collection_alias)
@@ -41,9 +45,13 @@ class QdrantIndexer:
     def _ensure_collection_named(self, collection_name: str) -> None:
         from qdrant_client import models
 
+        if collection_name in self._ensured_collections:
+            return
+
         client = self._client()
         collections = {collection.name for collection in client.get_collections().collections}
         if collection_name in collections:
+            self._ensured_collections.add(collection_name)
             return
 
         # Dense + sparse vectors
@@ -81,6 +89,7 @@ class QdrantIndexer:
                 )
             except Exception:
                 pass  # индекс может уже существовать
+        self._ensured_collections.add(collection_name)
 
     def ensure_versioned_collection(self, collection_name: str) -> None:
         """Create a versioned collection for manual reindex runs."""

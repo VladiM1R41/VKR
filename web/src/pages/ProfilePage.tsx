@@ -64,7 +64,7 @@ export function ProfilePage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.profile })
       queryClient.invalidateQueries({ queryKey: queryKeys.sources })
-      queryClient.invalidateQueries({ queryKey: queryKeys.feed() })
+      queryClient.invalidateQueries({ queryKey: queryKeys.feedRoot })
       queryClient.invalidateQueries({ queryKey: queryKeys.search('') })
     },
   })

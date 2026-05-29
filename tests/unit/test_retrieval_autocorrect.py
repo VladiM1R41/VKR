@@ -81,3 +81,14 @@ class TestAutocorrectQuery:
         assert hasattr(result, "original")
         assert hasattr(result, "corrected")
         assert hasattr(result, "was_corrected")
+
+    def test_skips_stopwords_even_when_vocabulary_has_similar_terms(self, monkeypatch):
+        monkeypatch.setattr(
+            "jarvis.retrieval.services.query_autocorrect._load_vocabulary",
+            lambda: {"человек": 100, "страна": 50},
+        )
+
+        result = autocorrect_query("что")
+
+        assert result.corrected == "что"
+        assert result.was_corrected is False

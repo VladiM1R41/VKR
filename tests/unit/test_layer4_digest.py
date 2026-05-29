@@ -180,3 +180,48 @@ def test_digest_shortlist_can_be_persisted() -> None:
     assert session.flush_called is True
     assert session.committed is True
     assert len(session.added) == 3
+
+
+def test_persist_shortlist_refreshes_existing_digest_text() -> None:
+    session = FakeSession()
+    existing = type(
+        "DigestStub",
+        (),
+        {
+            "id": 42,
+            "content_text": "old provider refusal",
+            "generation_log_id": 1,
+            "news_count": 1,
+            "topics_covered": [],
+            "generated_at": datetime.now(UTC),
+        },
+    )()
+    session.existing_hash = existing
+    service = DigestOrchestrationService()
+    shortlist = service.build_shortlist(
+        session,
+        user_id=7,
+        digest_type="morning",
+        ranked_response=PersonalizedSearchResponse(
+            query="q",
+            corrected_query=None,
+            intent="FACTUAL",
+            total=1,
+            results=[_result(102, "Технологии")],
+        ),
+        limit=1,
+    )
+
+    digest = service.persist_shortlist(
+        session,
+        shortlist=shortlist,
+        content_text="new digest text",
+        generation_log_id=99,
+    )
+
+    assert digest.id == 42
+    assert digest.content_text == "new digest text"
+    assert digest.generation_log_id == 99
+    assert digest.news_count == 1
+    assert digest.topics_covered == ["Технологии"]
+    assert session.committed is True

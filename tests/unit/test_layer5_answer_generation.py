@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from jarvis.generation.models.generation_models import (
     LLMGenerationRequest,
     LLMGenerationResponse,
@@ -14,6 +16,7 @@ from jarvis.generation.services.answer_generation_service import (
 from jarvis.generation.services.chat_memory_service import ChatMemoryService
 from jarvis.generation.services.context_assembler import NewsWithContext
 from jarvis.generation.services.providers.base import LLMProvider
+from jarvis.generation.services.providers.base import LLMProviderError
 
 
 class _AsyncFakeProvider(LLMProvider):
@@ -75,6 +78,7 @@ def _make_news_item(
     event_cluster_id: int | None = None,
     trust_score: float = 0.9,
     content_grade: int = 2,
+    url: str = "https://example.test/news",
 ) -> NewsWithContext:
     return NewsWithContext(
         news_id=news_id,
@@ -94,6 +98,7 @@ def _make_news_item(
         information_type="daily",
         urgency="normal",
         event_cluster_id=event_cluster_id,
+        url=url,
     )
 
 
@@ -242,7 +247,117 @@ def test_generate_digest_logs_real_news_ids(monkeypatch) -> None:
 
     assert result.generation_log_id == 77
     assert captured["entry"].documents_used[0]["news_id"] == 501
+    assert captured["entry"].documents_used[0]["url"] == "https://example.test/news"
+    assert captured["entry"].documents_used[0]["published_at"] == "2026-04-15"
     assert captured["entry"].documents_used[-1]["meta"]["generation_mode"] == "digest"
+
+
+def test_generate_digest_uses_digest_output_token_budget() -> None:
+    provider = _SequenceProvider(["Digest text (TASS)."])
+    service = AnswerGenerationService(
+        provider=provider,
+        config=GenerationConfig(enable_logging=False, digest_max_output_tokens=3333),
+    )
+
+    service.generate_digest(
+        news_items=[
+            _make_news_item(
+                news_id=503,
+                source_name="TASS",
+                title="Main event",
+                content="Main event happened today.",
+                personalized_score=0.95,
+                event_cluster_id=13,
+            )
+        ],
+        user_id=1,
+    )
+
+    assert provider.requests[0].max_output_tokens == 3333
+
+
+def test_generate_digest_adds_digest_style_instruction() -> None:
+    provider = _SequenceProvider(["Digest text (TASS)."])
+    service = AnswerGenerationService(
+        provider=provider,
+        config=GenerationConfig(enable_logging=False),
+    )
+
+    service.generate_digest(
+        news_items=[
+            _make_news_item(
+                news_id=504,
+                source_name="TASS",
+                title="Main event",
+                content="Main event happened today.",
+                personalized_score=0.95,
+                event_cluster_id=14,
+            )
+        ],
+        user_id=1,
+        digest_style="editorial",
+    )
+
+    assert "редакторский" in provider.requests[0].user_prompt
+
+
+def test_digest_correction_prompt_keeps_sources_in_metadata() -> None:
+    provider = _SequenceProvider(
+        [
+            "Martians built a bridge without evidence.",
+            "Событие дня подтверждено источником.",
+        ]
+    )
+    service = AnswerGenerationService(
+        provider=provider,
+        config=GenerationConfig(enable_logging=False),
+    )
+
+    service.generate_digest(
+        news_items=[
+            _make_news_item(
+                news_id=505,
+                source_name="TASS",
+                title="Main event",
+                content="Main event happened today.",
+                personalized_score=0.95,
+                event_cluster_id=15,
+            )
+        ],
+        user_id=1,
+    )
+
+    assert len(provider.requests) == 2
+    assert "не добавляй блок «Источники»" in provider.requests[1].user_prompt
+    assert "[Doc N]" in provider.requests[1].user_prompt
+    assert "Интерфейс покажет использованные статьи" in provider.requests[1].user_prompt
+
+
+def test_generate_digest_raises_when_provider_refuses() -> None:
+    refusal = (
+        "Генеративные языковые модели не обладают собственным мнением — их ответы являются "
+        "обобщением информации, находящейся в открытом доступе. Чтобы избежать ошибок и "
+        "неправильного толкования, разговоры на некоторые темы временно ограничены."
+    )
+    service = AnswerGenerationService(
+        provider=_AsyncFakeProvider(refusal),
+        config=GenerationConfig(enable_logging=False, enable_correction=False),
+    )
+
+    with pytest.raises(LLMProviderError):
+        service.generate_digest(
+            news_items=[
+                _make_news_item(
+                    news_id=506,
+                    source_name="CNews",
+                    title="ИИ помогает компаниям искать персональные данные",
+                    content="Компании начали применять ИИ для поиска неучтенных персональных данных в архивах.",
+                    personalized_score=0.95,
+                    event_cluster_id=16,
+                )
+            ],
+            user_id=1,
+        )
 
 
 def test_generate_digest_applies_quality_gate(monkeypatch) -> None:
@@ -281,10 +396,11 @@ def test_generate_digest_applies_quality_gate(monkeypatch) -> None:
         user_id=1,
     )
 
-    assert result.citation_valid is False
+    assert result.citation_valid is True
     assert result.has_unsupported_claims is True
     assert result.confidence == "LOW"
     assert captured["entry"].confidence == "LOW"
+    assert "Источники:" not in result.digest_text
     assert captured["entry"].documents_used[-1]["meta"]["groundedness_score"] < 0.45
 
 

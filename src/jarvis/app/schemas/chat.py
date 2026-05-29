@@ -18,6 +18,7 @@ class ChatSource(BaseModel):
     news_id: int
     source_name: str
     title: str
+    url: str = ""
 
 
 class ChatResponse(BaseModel):
