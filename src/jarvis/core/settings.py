@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     app_log_level: str = Field(default="INFO", alias="APP_LOG_LEVEL")
     app_log_json: bool = Field(default=True, alias="APP_LOG_JSON")
     app_log_dir: str = Field(default="logs", alias="APP_LOG_DIR")
+    auth_mode: str = Field(default="single_user", alias="AUTH_MODE")
+    jwt_secret_key: str = Field(default="CHANGE_ME_DEV_ONLY", alias="JWT_SECRET_KEY")
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    jwt_access_token_expire_minutes: int = Field(default=120, alias="JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
+    auth_password_min_length: int = Field(default=8, alias="AUTH_PASSWORD_MIN_LENGTH")
 
     postgres_host: str = Field(default="localhost", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
@@ -93,6 +98,18 @@ class Settings(BaseSettings):
             raise ValueError("PROCESSING_LOCK_TTL_SECONDS must be positive.")
         if self.processing_analytics_max_articles < 0:
             raise ValueError("PROCESSING_ANALYTICS_MAX_ARTICLES must be non-negative.")
+        if self.auth_mode not in {"single_user", "jwt"}:
+            raise ValueError("AUTH_MODE must be one of: single_user, jwt.")
+        if self.jwt_algorithm != "HS256":
+            raise ValueError("JWT_ALGORITHM must be HS256.")
+        if self.jwt_access_token_expire_minutes <= 0:
+            raise ValueError("JWT_ACCESS_TOKEN_EXPIRE_MINUTES must be positive.")
+        if self.auth_password_min_length < 8:
+            raise ValueError("AUTH_PASSWORD_MIN_LENGTH must be at least 8.")
+        if self.auth_mode == "jwt" and (
+            self.jwt_secret_key == "CHANGE_ME_DEV_ONLY" or len(self.jwt_secret_key) < 32
+        ):
+            raise ValueError("JWT_SECRET_KEY must be changed and contain at least 32 characters when AUTH_MODE=jwt.")
         if self.processing_embedding_backend not in {"auto", "flagembedding", "sentence-transformers"}:
             raise ValueError(
                 "PROCESSING_EMBEDDING_BACKEND must be one of: auto, flagembedding, sentence-transformers."

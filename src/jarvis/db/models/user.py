@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Integer, String, text
+from sqlalchemy import BigInteger, Boolean, Integer, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column
@@ -22,6 +22,7 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, unique=True)
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     settings: Mapped[dict] = mapped_column(
         MutableDict.as_mutable(JSONB),
         nullable=False,
