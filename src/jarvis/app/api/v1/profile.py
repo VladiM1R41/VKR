@@ -36,7 +36,9 @@ def update_preferences(
     user_id: int = Depends(get_current_user_id),
 ) -> ExplicitPreferencesResponse:
     data = payload.model_copy(deep=True)
-    data.profile.user_id = data.profile.user_id or user_id
+    if data.profile.user_id is not None and data.profile.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Cannot update another user's profile")
+    data.profile.user_id = user_id
     try:
         result = ExplicitPreferencesService().update_preferences(session, data)
         session.commit()
@@ -80,4 +82,3 @@ def interactions(
             for interaction, title in rows
         ],
     )
-

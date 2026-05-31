@@ -96,12 +96,19 @@ def suggest(
 @router.get("/logs", response_model=SearchLogsResponse)
 def search_logs(
     session: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ) -> SearchLogsResponse:
-    total = session.scalar(select(func.count()).select_from(SearchLog)) or 0
+    total = session.scalar(
+        select(func.count()).select_from(SearchLog).where(SearchLog.user_id == user_id)
+    ) or 0
     rows = session.scalars(
-        select(SearchLog).order_by(desc(SearchLog.created_at)).limit(limit).offset(offset)
+        select(SearchLog)
+        .where(SearchLog.user_id == user_id)
+        .order_by(desc(SearchLog.created_at))
+        .limit(limit)
+        .offset(offset)
     ).all()
     return SearchLogsResponse(
         total=total,

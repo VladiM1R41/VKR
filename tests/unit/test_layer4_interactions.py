@@ -127,6 +127,18 @@ def test_log_interaction_rejects_unknown_search_log() -> None:
         )
 
 
+def test_search_log_validation_is_scoped_to_user() -> None:
+    session = Mock()
+    session.scalar.return_value = None
+
+    with pytest.raises(ValueError, match="Search log 99 not found for user 2"):
+        InteractionLoggingService._ensure_search_log(session, search_log_id=99, user_id=2)
+
+    sql = str(session.scalar.call_args.args[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "search_logs.id = 99" in sql
+    assert "search_logs.user_id = 2" in sql
+
+
 def test_log_interaction_can_defer_commit() -> None:
     history = FakeSeenHistory()
     service = InteractionLoggingService(seen_history=history)
