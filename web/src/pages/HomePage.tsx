@@ -9,6 +9,7 @@ import { SearchBox } from '../features/search/SearchBox'
 import { api } from '../shared/api/client'
 import type { TopicFilter } from '../shared/api/client'
 import { queryKeys } from '../shared/api/queryKeys'
+import { NewscopeLogo } from '../shared/ui/NewscopeLogo'
 import { ErrorBlock, LoadingBlock } from '../shared/ui/State'
 
 function FilterButton({
@@ -65,22 +66,28 @@ export function HomePage() {
   return (
     <section className="news-bg relative left-1/2 -ml-[50vw] -my-8 min-h-screen w-screen px-6 py-10 xl:px-10">
       <div className="mx-auto max-w-[1580px]">
-        <div className="mb-10 grid gap-8 lg:grid-cols-[1.1fr_0.9fr] lg:items-end">
-          <div>
+        <div className="relative mb-10 min-h-[540px] pt-14">
+          <div className="pointer-events-none absolute right-[-130px] top-[-72px] z-0 hidden lg:block xl:right-[-10px]">
+            <div className="absolute left-[-170px] top-[-90px] h-[860px] w-[860px] rounded-full bg-[#f3f8ff]/70 blur-[96px]" />
+            <div className="absolute left-[10px] top-[90px] h-[610px] w-[610px] rounded-full bg-[#eaf4ff]/58 blur-[84px]" />
+            <NewscopeLogo className="relative h-[790px] w-[790px]" />
+          </div>
+
+          <div className="relative z-10 max-w-[760px]">
             <p className="label mb-3">Мониторинг электронных СМИ</p>
             <h1 className="font-display text-5xl font-black leading-none md:text-7xl">
               Лента, поиск и ответы по корпусу новостей в одном рабочем месте.
             </h1>
           </div>
-          <div className="rounded-[2rem] bg-[#2563eb] p-6 text-white shadow-panel">
-            <p className="text-lg text-white/90">
-              Здесь можно проверить весь конвейер: новости собираются, обрабатываются, ищутся,
-              персонализируются и используются как контекст для генерации ответов.
-            </p>
+
+          <p className="relative z-10 mt-9 mb-3 max-w-2xl text-sm leading-6 text-ink/50">
+            Следите за важными событиями, находите нужные материалы и получайте ответы на основе
+            актуальных публикаций.
+          </p>
+          <div className="relative z-20">
+            <SearchBox onSearch={setQuery} isLoading={search.isFetching} />
           </div>
         </div>
-
-        <SearchBox onSearch={setQuery} isLoading={search.isFetching} />
 
         {query && (
           <div className="mt-8">
