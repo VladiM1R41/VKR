@@ -38,6 +38,77 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Register */
+        post: operations["register_api_v1_auth_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Login */
+        post: operations["login_api_v1_auth_login_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Me */
+        get: operations["me_api_v1_auth_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description Frontend-friendly logout endpoint for stateless JWT sessions.
+         */
+        post: operations["logout_api_v1_auth_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/news/feed": {
         parameters: {
             query?: never;
@@ -501,6 +572,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Users */
+        get: operations["users_api_v1_admin_users_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/users/{user_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update User */
+        patch: operations["update_user_api_v1_admin_users__user_id__patch"];
+        trace?: never;
+    };
+    "/api/v1/admin/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Settings */
+        get: operations["settings_api_v1_admin_settings_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -561,6 +683,19 @@ export interface components {
             /** Recent Queries */
             recent_queries: Record<string, never>[];
         };
+        /** AdminSettingsResponse */
+        AdminSettingsResponse: {
+            /** Auth */
+            auth: Record<string, never>;
+            /** Runtime */
+            runtime: Record<string, never>;
+            /** Retrieval */
+            retrieval: Record<string, never>;
+            /** Llm */
+            llm: Record<string, never>;
+            /** Celery */
+            celery: Record<string, never>;
+        };
         /** AdminSourceItem */
         AdminSourceItem: {
             /** Id */
@@ -588,6 +723,123 @@ export interface components {
         AdminSourcesResponse: {
             /** Items */
             items: components["schemas"]["AdminSourceItem"][];
+        };
+        /** AdminUserItem */
+        AdminUserItem: {
+            /** Id */
+            id: number;
+            /** Username */
+            username: string;
+            /** Email */
+            email?: string | null;
+            /** Is Admin */
+            is_admin: boolean;
+            /** Has Password */
+            has_password: boolean;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Last Active At */
+            last_active_at?: string | null;
+            /**
+             * Chat Sessions
+             * @default 0
+             */
+            chat_sessions: number;
+            /**
+             * Interactions
+             * @default 0
+             */
+            interactions: number;
+            /**
+             * Digests
+             * @default 0
+             */
+            digests: number;
+            /**
+             * Search Logs
+             * @default 0
+             */
+            search_logs: number;
+            /**
+             * Generation Logs
+             * @default 0
+             */
+            generation_logs: number;
+        };
+        /** AdminUserUpdateRequest */
+        AdminUserUpdateRequest: {
+            /** Is Admin */
+            is_admin?: boolean | null;
+        };
+        /** AdminUsersResponse */
+        AdminUsersResponse: {
+            /** Items */
+            items: components["schemas"]["AdminUserItem"][];
+            /** Total */
+            total: number;
+            /** Admin Count */
+            admin_count: number;
+        };
+        /** AuthLoginRequest */
+        AuthLoginRequest: {
+            /** Login */
+            login: string;
+            /** Password */
+            password: string;
+        };
+        /** AuthLogoutResponse */
+        AuthLogoutResponse: {
+            /**
+             * Logged Out
+             * @default true
+             */
+            logged_out: boolean;
+        };
+        /** AuthRegisterRequest */
+        AuthRegisterRequest: {
+            /** Username */
+            username: string;
+            /** Email */
+            email?: string | null;
+            /** Password */
+            password: string;
+        };
+        /** AuthTokenResponse */
+        AuthTokenResponse: {
+            /** Access Token */
+            access_token: string;
+            /**
+             * Token Type
+             * @default bearer
+             */
+            token_type: string;
+            /** Expires In */
+            expires_in: number;
+            user: components["schemas"]["AuthUserResponse"];
+        };
+        /** AuthUserResponse */
+        AuthUserResponse: {
+            /** Id */
+            id: number;
+            /** Username */
+            username: string;
+            /** Email */
+            email?: string | null;
+            /**
+             * Is Admin
+             * @default false
+             */
+            is_admin: boolean;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Last Active At */
+            last_active_at?: string | null;
         };
         /** ChatMessageItem */
         ChatMessageItem: {
@@ -1527,6 +1779,112 @@ export interface operations {
             };
         };
     };
+    register_api_v1_auth_register_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthRegisterRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthTokenResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    login_api_v1_auth_login_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AuthLoginRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthTokenResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    me_api_v1_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthUserResponse"];
+                };
+            };
+        };
+    };
+    logout_api_v1_auth_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthLogoutResponse"];
+                };
+            };
+        };
+    };
     get_news_feed_api_v1_news_feed_get: {
         parameters: {
             query?: {
@@ -2347,6 +2705,81 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AdminGenerationStatsResponse"];
+                };
+            };
+        };
+    };
+    users_api_v1_admin_users_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUsersResponse"];
+                };
+            };
+        };
+    };
+    update_user_api_v1_admin_users__user_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminUserUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminUserItem"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    settings_api_v1_admin_settings_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminSettingsResponse"];
                 };
             };
         };
