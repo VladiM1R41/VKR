@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from jarvis.app.dependencies import get_current_user_id, get_db
+from jarvis.app.dependencies import get_current_user_id, get_db, resolve_current_user_id
 from jarvis.app.schemas.chat import (
     ChatMessageItem,
     ChatMessagesResponse,
@@ -197,8 +197,10 @@ async def chat_ws(websocket: WebSocket) -> None:
         request = ChatRequest.model_validate(payload)
         from jarvis.db.session import SyncSessionLocal
 
+        token = websocket.query_params.get("access_token") or websocket.query_params.get("token")
         with SyncSessionLocal() as db:
-            response = chat(request, db, get_current_user_id())
+            user_id = resolve_current_user_id(db, token=token)
+            response = chat(request, db, user_id)
         for token in response.answer.split():
             await websocket.send_json({"type": "token", "content": token + " "})
         await websocket.send_json({"type": "done", "payload": response.model_dump(mode="json")})

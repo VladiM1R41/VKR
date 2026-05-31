@@ -90,7 +90,7 @@ class HTTPLLMProvider(LLMProvider):
         return headers
 
     def _build_payload(self, request: LLMGenerationRequest) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "model": self.config.model_name,
             "messages": [
                 {"role": "system", "content": request.system_prompt},
@@ -102,12 +102,15 @@ class HTTPLLMProvider(LLMProvider):
             "temperature": (
                 self.config.temperature if request.temperature is None else request.temperature
             ),
-            "max_tokens": (
-                self.config.max_output_tokens
-                if request.max_output_tokens is None
-                else request.max_output_tokens
-            ),
         }
+        max_tokens = (
+            self.config.max_output_tokens
+            if request.max_output_tokens is None
+            else request.max_output_tokens
+        )
+        if max_tokens is not None and max_tokens > 0:
+            payload["max_tokens"] = max_tokens
+        return payload
 
     @staticmethod
     def _compose_user_content(request: LLMGenerationRequest) -> str:

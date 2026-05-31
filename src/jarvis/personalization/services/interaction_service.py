@@ -124,7 +124,7 @@ class InteractionLoggingService:
         """Persist one interaction event and update short-term seen history."""
         self._ensure_user_and_news(session, user_id=event.user_id, news_id=event.news_id)
         if event.search_log_id is not None:
-            self._ensure_search_log(session, event.search_log_id)
+            self._ensure_search_log(session, search_log_id=event.search_log_id, user_id=event.user_id)
 
         stored_action, signal = _SIGNAL_BY_ACTION[event.action]
         interaction = UserInteraction(
@@ -177,7 +177,12 @@ class InteractionLoggingService:
             raise ValueError(f"News {news_id} not found")
 
     @staticmethod
-    def _ensure_search_log(session: Session, search_log_id: int) -> None:
-        found = session.scalar(select(SearchLog.id).where(SearchLog.id == search_log_id))
+    def _ensure_search_log(session: Session, *, search_log_id: int, user_id: int) -> None:
+        found = session.scalar(
+            select(SearchLog.id).where(
+                SearchLog.id == search_log_id,
+                SearchLog.user_id == user_id,
+            )
+        )
         if found is None:
-            raise ValueError(f"Search log {search_log_id} not found")
+            raise ValueError(f"Search log {search_log_id} not found for user {user_id}")

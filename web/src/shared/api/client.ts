@@ -3,6 +3,22 @@ import type { paths } from './schema'
 
 export const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 export const openapiClient = createClient<paths>({ baseUrl: API_URL })
+export const AUTH_TOKEN_STORAGE_KEY = 'newscope.auth.access_token'
+
+export function getStoredAccessToken(): string | null {
+  if (typeof window === 'undefined') return null
+  return window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY)
+}
+
+export function setStoredAccessToken(token: string): void {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token)
+}
+
+export function clearStoredAccessToken(): void {
+  if (typeof window === 'undefined') return
+  window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY)
+}
 
 async function responseErrorMessage(response: Response): Promise<string> {
   const text = await response.text()
@@ -27,9 +43,11 @@ async function responseErrorMessage(response: Response): Promise<string> {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getStoredAccessToken()
   const response = await fetch(`${API_URL}${path}`, {
     headers: {
       'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {}),
     },
     ...init,
@@ -38,6 +56,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(await responseErrorMessage(response))
   }
   return response.json() as Promise<T>
+}
+
+export type AuthUser = {
+  id: number
+  username: string
+  email?: string | null
+  is_admin: boolean
+  created_at: string
+  last_active_at?: string | null
+}
+export type AuthTokenResponse = {
+  access_token: string
+  token_type: string
+  expires_in: number
+  user: AuthUser
+}
+export type AuthRegisterPayload = {
+  username: string
+  email?: string | null
+  password: string
+}
+export type AuthLoginPayload = {
+  login: string
+  password: string
 }
 
 export type NewsSummary = {
@@ -151,6 +193,32 @@ export type PreferencePayload = {
   tracked_keywords?: Array<{ keyword: string }>
   source_preferences?: Array<{ source_id: number; preference: string }>
 }
+export type AdminUserItem = {
+  id: number
+  username: string
+  email?: string | null
+  is_admin: boolean
+  has_password: boolean
+  created_at: string
+  last_active_at?: string | null
+  chat_sessions: number
+  interactions: number
+  digests: number
+  search_logs: number
+  generation_logs: number
+}
+export type AdminUsersResponse = {
+  items: AdminUserItem[]
+  total: number
+  admin_count: number
+}
+export type AdminSettingsResponse = {
+  auth: Record<string, unknown>
+  runtime: Record<string, unknown>
+  retrieval: Record<string, unknown>
+  llm: Record<string, unknown>
+  celery: Record<string, unknown>
+}
 
 function toQuery(params: Record<string, string | number | boolean | Array<string | number> | null | undefined>): string {
   const search = new URLSearchParams()
@@ -166,6 +234,18 @@ function toQuery(params: Record<string, string | number | boolean | Array<string
 }
 
 export const api = {
+  register: (payload: AuthRegisterPayload) =>
+    request<AuthTokenResponse>('/api/v1/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  login: (payload: AuthLoginPayload) =>
+    request<AuthTokenResponse>('/api/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  me: () => request<AuthUser>('/api/v1/auth/me'),
+  logout: () => request<{ logged_out: boolean }>('/api/v1/auth/logout', { method: 'POST' }),
   feed: (filters: FeedFilters = {}) =>
     request<FeedResponse>(
       `/api/v1/news/feed${toQuery({
@@ -226,4 +306,11 @@ export const api = {
   adminProcessing: () => request<any>('/api/v1/admin/processing'),
   adminSearch: () => request<any>('/api/v1/admin/search-stats'),
   adminGeneration: () => request<any>('/api/v1/admin/generation-stats'),
+  adminUsers: () => request<AdminUsersResponse>('/api/v1/admin/users'),
+  updateAdminUser: (id: number, isAdmin: boolean) =>
+    request<AdminUserItem>(`/api/v1/admin/users/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ is_admin: isAdmin }),
+    }),
+  adminSettings: () => request<AdminSettingsResponse>('/api/v1/admin/settings'),
 }

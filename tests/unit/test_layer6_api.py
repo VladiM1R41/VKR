@@ -12,6 +12,10 @@ def test_layer6_openapi_contains_core_routes() -> None:
     schema = app.openapi()
 
     assert schema["info"]["title"] == "Newscope API"
+    assert "/api/v1/auth/register" in schema["paths"]
+    assert "/api/v1/auth/login" in schema["paths"]
+    assert "/api/v1/auth/me" in schema["paths"]
+    assert "/api/v1/auth/logout" in schema["paths"]
     assert "/api/v1/news/feed" in schema["paths"]
     assert "/api/v1/news/sources" in schema["paths"]
     assert "/api/v1/news/topics" in schema["paths"]

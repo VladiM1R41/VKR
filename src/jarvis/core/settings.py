@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     app_log_level: str = Field(default="INFO", alias="APP_LOG_LEVEL")
     app_log_json: bool = Field(default=True, alias="APP_LOG_JSON")
     app_log_dir: str = Field(default="logs", alias="APP_LOG_DIR")
+    auth_mode: str = Field(default="single_user", alias="AUTH_MODE")
+    jwt_secret_key: str = Field(default="CHANGE_ME_DEV_ONLY", alias="JWT_SECRET_KEY")
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    jwt_access_token_expire_minutes: int = Field(default=120, alias="JWT_ACCESS_TOKEN_EXPIRE_MINUTES")
+    auth_password_min_length: int = Field(default=8, alias="AUTH_PASSWORD_MIN_LENGTH")
 
     postgres_host: str = Field(default="localhost", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
@@ -53,12 +58,14 @@ class Settings(BaseSettings):
 
     jarvis_llm_provider: str = Field(default="gigachat", alias="JARVIS_LLM_PROVIDER")
     jarvis_llm_model: str = Field(default="gigachat-max", alias="JARVIS_LLM_MODEL")
-    jarvis_llm_timeout_sec: float = Field(default=30.0, alias="JARVIS_LLM_TIMEOUT_SEC")
+    jarvis_llm_timeout_sec: float = Field(default=60.0, alias="JARVIS_LLM_TIMEOUT_SEC")
     jarvis_llm_retry_attempts: int = Field(default=2, alias="JARVIS_LLM_RETRY_ATTEMPTS")
-    jarvis_llm_max_input_tokens: int = Field(default=20000, alias="JARVIS_LLM_MAX_INPUT_TOKENS")
-    jarvis_llm_max_output_tokens: int = Field(default=1200, alias="JARVIS_LLM_MAX_OUTPUT_TOKENS")
+    jarvis_llm_max_input_tokens: int = Field(default=100000, alias="JARVIS_LLM_MAX_INPUT_TOKENS")
+    jarvis_llm_max_output_tokens: int = Field(default=0, alias="JARVIS_LLM_MAX_OUTPUT_TOKENS")
+    jarvis_llm_digest_max_output_tokens: int = Field(default=0, alias="JARVIS_LLM_DIGEST_MAX_OUTPUT_TOKENS")
     jarvis_llm_temperature: float = Field(default=0.2, alias="JARVIS_LLM_TEMPERATURE")
     jarvis_llm_fallback_provider: str = Field(default="", alias="JARVIS_LLM_FALLBACK_PROVIDER")
+    jarvis_llm_allow_fake_fallback: bool = Field(default=False, alias="JARVIS_LLM_ALLOW_FAKE_FALLBACK")
     jarvis_rag_mode: str = Field(default="standard", alias="JARVIS_RAG_MODE")
     jarvis_rag_enable_cache: bool = Field(default=True, alias="JARVIS_RAG_ENABLE_CACHE")
     jarvis_rag_streaming_enabled: bool = Field(default=False, alias="JARVIS_RAG_STREAMING_ENABLED")
@@ -71,6 +78,10 @@ class Settings(BaseSettings):
     gigachat_ca_bundle: str | None = Field(default=None, alias="GIGACHAT_CA_BUNDLE")
     yandexgpt_api_key: str | None = Field(default=None, alias="YandexGPT_API_KEY")
     yandexgpt_base_url: str | None = Field(default=None, alias="YandexGPT_BASE_URL")
+    openrouter_api_key: str | None = Field(default=None, alias="OPENROUTER_API_KEY")
+    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1", alias="OPENROUTER_BASE_URL")
+    openrouter_site_url: str | None = Field(default="http://localhost:5173", alias="OPENROUTER_SITE_URL")
+    openrouter_app_name: str = Field(default="Newscope", alias="OPENROUTER_APP_NAME")
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -93,6 +104,18 @@ class Settings(BaseSettings):
             raise ValueError("PROCESSING_LOCK_TTL_SECONDS must be positive.")
         if self.processing_analytics_max_articles < 0:
             raise ValueError("PROCESSING_ANALYTICS_MAX_ARTICLES must be non-negative.")
+        if self.auth_mode not in {"single_user", "jwt"}:
+            raise ValueError("AUTH_MODE must be one of: single_user, jwt.")
+        if self.jwt_algorithm != "HS256":
+            raise ValueError("JWT_ALGORITHM must be HS256.")
+        if self.jwt_access_token_expire_minutes <= 0:
+            raise ValueError("JWT_ACCESS_TOKEN_EXPIRE_MINUTES must be positive.")
+        if self.auth_password_min_length < 8:
+            raise ValueError("AUTH_PASSWORD_MIN_LENGTH must be at least 8.")
+        if self.auth_mode == "jwt" and (
+            self.jwt_secret_key == "CHANGE_ME_DEV_ONLY" or len(self.jwt_secret_key) < 32
+        ):
+            raise ValueError("JWT_SECRET_KEY must be changed and contain at least 32 characters when AUTH_MODE=jwt.")
         if self.processing_embedding_backend not in {"auto", "flagembedding", "sentence-transformers"}:
             raise ValueError(
                 "PROCESSING_EMBEDDING_BACKEND must be one of: auto, flagembedding, sentence-transformers."
@@ -115,10 +138,17 @@ class Settings(BaseSettings):
             raise ValueError("JARVIS_LLM_RETRY_ATTEMPTS must be non-negative.")
         if self.jarvis_llm_max_input_tokens <= 0:
             raise ValueError("JARVIS_LLM_MAX_INPUT_TOKENS must be positive.")
-        if self.jarvis_llm_max_output_tokens <= 0:
-            raise ValueError("JARVIS_LLM_MAX_OUTPUT_TOKENS must be positive.")
+        if self.jarvis_llm_max_output_tokens < 0:
+            raise ValueError("JARVIS_LLM_MAX_OUTPUT_TOKENS must be non-negative; use 0 to omit max_tokens.")
+        if self.jarvis_llm_digest_max_output_tokens < 0:
+            raise ValueError("JARVIS_LLM_DIGEST_MAX_OUTPUT_TOKENS must be non-negative; use 0 to omit max_tokens.")
         if not 0.0 <= self.jarvis_llm_temperature <= 2.0:
             raise ValueError("JARVIS_LLM_TEMPERATURE must stay between 0.0 and 2.0.")
+        if self.jarvis_llm_provider.strip().lower() == "openrouter":
+            if not self.openrouter_api_key:
+                raise ValueError("OPENROUTER_API_KEY must be set when JARVIS_LLM_PROVIDER=openrouter.")
+            if not self.openrouter_base_url:
+                raise ValueError("OPENROUTER_BASE_URL must be set when JARVIS_LLM_PROVIDER=openrouter.")
         if self.app_env.strip().lower() in {"prod", "production"} and not self.gigachat_tls_verify:
             raise ValueError("GIGACHAT_TLS_VERIFY cannot be disabled in production.")
         return self

@@ -2,6 +2,7 @@ import { createBrowserRouter } from 'react-router'
 
 import { RootLayout } from './RootLayout'
 import { AdminPage } from '../pages/AdminPage'
+import { AuthPage } from '../pages/AuthPage'
 import { ChatPage } from '../pages/ChatPage'
 import { DigestPage } from '../pages/DigestPage'
 import { HomePage } from '../pages/HomePage'
@@ -14,6 +15,8 @@ export const router = createBrowserRouter([
     element: <RootLayout />,
     children: [
       { index: true, element: <HomePage /> },
+      { path: 'login', element: <AuthPage initialMode="login" /> },
+      { path: 'register', element: <AuthPage initialMode="register" /> },
       { path: 'news/:newsId', element: <NewsDetailPage /> },
       { path: 'chat', element: <ChatPage /> },
       { path: 'chat/:sessionId', element: <ChatPage /> },
@@ -23,4 +26,3 @@ export const router = createBrowserRouter([
     ],
   },
 ])
-

@@ -6,6 +6,7 @@ from jarvis.core.settings import get_settings
 from jarvis.generation.services.providers.base import LLMProvider, LLMGenerationRequest, LLMGenerationResponse, ProviderConfig
 from jarvis.generation.services.providers.fallback_provider import FallbackLLMProvider
 from jarvis.generation.services.providers.gigachat_provider import GigaChatProvider
+from jarvis.generation.services.providers.openrouter_provider import OpenRouterProvider
 from jarvis.generation.services.providers.yandexgpt_provider import YandexGPTProvider
 
 _FAKE_CONFIG = ProviderConfig(
@@ -13,8 +14,8 @@ _FAKE_CONFIG = ProviderConfig(
     model_name="jarvis-demo-v1",
     timeout_sec=30.0,
     retry_attempts=0,
-    max_input_tokens=20000,
-    max_output_tokens=1200,
+    max_input_tokens=100000,
+    max_output_tokens=None,
     temperature=0.2,
     base_url=None,
     api_key=None,
@@ -103,6 +104,8 @@ def _make_provider(name: str) -> LLMProvider:
     normalized = name.strip().lower()
     if normalized == "gigachat":
         return GigaChatProvider()
+    if normalized == "openrouter":
+        return OpenRouterProvider()
     if normalized == "yandexgpt":
         return YandexGPTProvider()
     if normalized == "fake":
@@ -119,9 +122,12 @@ def build_primary_provider() -> LLMProvider | FallbackLLMProvider:
     if fallback_name:
         providers.append(_make_provider(fallback_name))
 
-    # Demo fallback is useful locally, but in production it would hide real LLM
-    # outages behind synthetic answers.
-    allow_fake_fallback = settings.app_env.strip().lower() not in {"prod", "production"}
+    # Demo fallback must be explicit: otherwise real UI checks can silently
+    # turn a provider failure into a synthetic digest/answer.
+    allow_fake_fallback = (
+        getattr(settings, "jarvis_llm_allow_fake_fallback", False)
+        and settings.app_env.strip().lower() not in {"prod", "production"}
+    )
     if allow_fake_fallback and all(provider.provider_name != "fake" for provider in providers):
         providers.append(_FakeLLMProvider())
 

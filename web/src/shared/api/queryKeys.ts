@@ -10,4 +10,6 @@ export const queryKeys = {
   profile: ['profile'] as const,
   digest: (type = 'on_demand') => ['digest', type] as const,
   adminOverview: ['admin', 'overview'] as const,
+  adminUsers: ['admin', 'users'] as const,
+  adminSettings: ['admin', 'settings'] as const,
 }

@@ -14,8 +14,8 @@ class ProviderConfig(BaseModel):
     model_name: str
     timeout_sec: float = 30.0
     retry_attempts: int = 2
-    max_input_tokens: int = 20000
-    max_output_tokens: int = 1200
+    max_input_tokens: int = 100000
+    max_output_tokens: int | None = None
     temperature: float = 0.2
     base_url: str | None = None
     api_key: str | None = None

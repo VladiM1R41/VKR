@@ -12,7 +12,6 @@ type SourcePreference = 'preferred' | 'neutral' | 'blocked'
 function preserveProfilePayload(data: ProfileResponse, settings: Record<string, unknown>): PreferencePayload {
   return {
     profile: {
-      user_id: data.profile.user_id,
       username: data.profile.username,
       email: data.profile.email,
       settings,
