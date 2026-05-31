@@ -21,6 +21,7 @@ from jarvis.generation.services.providers import (
     LLMProviderError,
     LLMRateLimitError,
     LLMTimeoutError,
+    OpenRouterProvider,
     YandexGPTProvider,
 )
 from jarvis.generation.services.providers.factory import _make_provider, build_primary_provider
@@ -103,6 +104,7 @@ class _TestHTTPLLMProvider(HTTPLLMProvider):
 
 def test_factory_supports_expected_provider_names() -> None:
     assert isinstance(_make_provider("gigachat"), GigaChatProvider)
+    assert isinstance(_make_provider("openrouter"), OpenRouterProvider)
     assert isinstance(_make_provider("yandexgpt"), YandexGPTProvider)
 
 
@@ -140,6 +142,74 @@ def test_factory_does_not_add_fake_fallback_in_production(monkeypatch: pytest.Mo
 
     assert not isinstance(provider, FallbackLLMProvider)
     assert provider.provider_name == "gigachat"
+
+
+def test_factory_does_not_add_fake_fallback_by_default_in_development(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis.generation.services.providers.factory as factory_module
+
+    monkeypatch.setattr(
+        factory_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            app_env="development",
+            jarvis_llm_provider="gigachat",
+            jarvis_llm_fallback_provider="",
+            jarvis_llm_allow_fake_fallback=False,
+            jarvis_llm_model="gigachat-max",
+            jarvis_llm_timeout_sec=30.0,
+            jarvis_llm_retry_attempts=2,
+            jarvis_llm_max_input_tokens=20000,
+            jarvis_llm_max_output_tokens=1200,
+            jarvis_llm_temperature=0.2,
+            gigachat_base_url=None,
+            gigachat_api_key="token",
+            gigachat_auth_key=None,
+            gigachat_scope="GIGACHAT_API_PERS",
+            gigachat_tls_verify=True,
+            gigachat_ca_bundle=None,
+        ),
+    )
+
+    provider = build_primary_provider()
+
+    assert not isinstance(provider, FallbackLLMProvider)
+    assert provider.provider_name == "gigachat"
+
+
+def test_factory_adds_fake_fallback_only_when_explicitly_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis.generation.services.providers.factory as factory_module
+
+    monkeypatch.setattr(
+        factory_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            app_env="development",
+            jarvis_llm_provider="gigachat",
+            jarvis_llm_fallback_provider="",
+            jarvis_llm_allow_fake_fallback=True,
+            jarvis_llm_model="gigachat-max",
+            jarvis_llm_timeout_sec=30.0,
+            jarvis_llm_retry_attempts=2,
+            jarvis_llm_max_input_tokens=20000,
+            jarvis_llm_max_output_tokens=1200,
+            jarvis_llm_temperature=0.2,
+            gigachat_base_url=None,
+            gigachat_api_key="token",
+            gigachat_auth_key=None,
+            gigachat_scope="GIGACHAT_API_PERS",
+            gigachat_tls_verify=True,
+            gigachat_ca_bundle=None,
+        ),
+    )
+
+    provider = build_primary_provider()
+
+    assert isinstance(provider, FallbackLLMProvider)
+    assert [item.provider_name for item in provider._providers] == ["gigachat", "fake"]
 
 
 def test_gigachat_uses_tls_verify_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -199,6 +269,76 @@ def test_gigachat_uses_ca_bundle_when_configured(monkeypatch: pytest.MonkeyPatch
 def test_settings_rejects_disabled_gigachat_tls_in_production() -> None:
     with pytest.raises(ValidationError, match="GIGACHAT_TLS_VERIFY"):
         Settings(APP_ENV="production", GIGACHAT_TLS_VERIFY=False)
+
+
+def test_settings_requires_openrouter_api_key_when_enabled() -> None:
+    with pytest.raises(ValidationError, match="OPENROUTER_API_KEY"):
+        Settings(JARVIS_LLM_PROVIDER="openrouter", OPENROUTER_API_KEY="")
+
+
+def test_openrouter_provider_uses_openai_compatible_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis.generation.services.providers.openrouter_provider as openrouter_module
+
+    monkeypatch.setattr(
+        openrouter_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            jarvis_llm_model="openrouter/owl-alpha",
+            jarvis_llm_timeout_sec=120.0,
+            jarvis_llm_retry_attempts=2,
+            jarvis_llm_max_input_tokens=100000,
+            jarvis_llm_max_output_tokens=12000,
+            jarvis_llm_temperature=0.2,
+            openrouter_base_url="https://openrouter.ai/api/v1",
+            openrouter_api_key="openrouter-test-key",
+            openrouter_site_url="http://localhost:5173",
+            openrouter_app_name="Newscope",
+        ),
+    )
+
+    provider = OpenRouterProvider()
+
+    assert provider.provider_name == "openrouter"
+    assert provider.config.model_name == "openrouter/owl-alpha"
+    assert provider.config.base_url == "https://openrouter.ai/api/v1"
+    assert provider.config.api_key == "openrouter-test-key"
+    assert provider._endpoint_path == "/chat/completions"
+    headers = provider._build_headers()
+    assert headers["Authorization"] == "Bearer openrouter-test-key"
+    assert headers["HTTP-Referer"] == "http://localhost:5173"
+    assert headers["X-Title"] == "Newscope"
+    assert headers["X-OpenRouter-Title"] == "Newscope"
+
+
+def test_openrouter_payload_omits_output_limit_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jarvis.generation.services.providers.openrouter_provider as openrouter_module
+
+    monkeypatch.setattr(
+        openrouter_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            jarvis_llm_model="openrouter/owl-alpha",
+            jarvis_llm_timeout_sec=120.0,
+            jarvis_llm_retry_attempts=2,
+            jarvis_llm_max_input_tokens=100000,
+            jarvis_llm_max_output_tokens=0,
+            jarvis_llm_temperature=0.2,
+            openrouter_base_url="https://openrouter.ai/api/v1",
+            openrouter_api_key="openrouter-test-key",
+            openrouter_site_url=None,
+            openrouter_app_name="Newscope",
+        ),
+    )
+
+    provider = OpenRouterProvider()
+    payload = provider._build_payload(LLMGenerationRequest(user_prompt="hello"))
+
+    assert payload["model"] == "openrouter/owl-alpha"
+    assert "max_tokens" not in payload
 
 
 @pytest.mark.asyncio
@@ -305,6 +445,24 @@ def test_request_model_keeps_metadata_and_overrides() -> None:
     assert request.max_output_tokens == 777
     assert request.temperature == 0.4
     assert request.metadata["intent"] == "FACTUAL"
+
+
+def test_http_provider_omits_max_tokens_when_output_limit_is_disabled() -> None:
+    provider = _TestHTTPLLMProvider(retry_attempts=0)
+
+    payload = provider._build_payload(LLMGenerationRequest(user_prompt="hello"))
+
+    assert "max_tokens" not in payload
+
+
+def test_http_provider_sends_explicit_request_output_limit() -> None:
+    provider = _TestHTTPLLMProvider(retry_attempts=0)
+
+    payload = provider._build_payload(
+        LLMGenerationRequest(user_prompt="hello", max_output_tokens=777)
+    )
+
+    assert payload["max_tokens"] == 777
 
 
 @pytest.mark.asyncio
