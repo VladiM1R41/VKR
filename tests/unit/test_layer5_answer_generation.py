@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,28 @@ from jarvis.generation.services.chat_memory_service import ChatMemoryService
 from jarvis.generation.services.context_assembler import NewsWithContext
 from jarvis.generation.services.providers.base import LLMProvider
 from jarvis.generation.services.providers.base import LLMProviderError
+
+
+def test_generation_config_reads_llm_token_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    import jarvis.generation.services.answer_generation_service as generation_module
+
+    monkeypatch.setattr(
+        generation_module,
+        "get_settings",
+        lambda: SimpleNamespace(
+            jarvis_llm_max_input_tokens=100000,
+            jarvis_llm_max_output_tokens=0,
+            jarvis_llm_digest_max_output_tokens=0,
+            jarvis_llm_temperature=0.25,
+        ),
+    )
+
+    config = GenerationConfig.from_settings()
+
+    assert config.max_input_tokens == 100000
+    assert config.max_output_tokens is None
+    assert config.digest_max_output_tokens is None
+    assert config.temperature == 0.25
 
 
 class _AsyncFakeProvider(LLMProvider):
@@ -65,6 +88,19 @@ class _NoCache:
 
     def set(self, **kwargs) -> None:
         return None
+
+
+class _CaptureCache:
+    def __init__(self) -> None:
+        self.get_calls: list[dict] = []
+        self.set_calls: list[dict] = []
+
+    def get(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return None
+
+    def set(self, **kwargs) -> None:
+        self.set_calls.append(kwargs)
 
 
 def _make_news_item(
@@ -125,6 +161,37 @@ def test_generate_answer_works_with_async_provider() -> None:
     assert result.model_name == "fake-model"
     assert result.sources[0].news_id == 101
     assert result.citation_valid is True
+
+
+def test_generate_answer_keeps_current_query_separate_from_chat_memory() -> None:
+    provider = _SequenceProvider(["AI will change developer work [Doc 1]."])
+    service = AnswerGenerationService(
+        provider=provider,
+        config=GenerationConfig(enable_logging=False, enable_correction=False),
+    )
+    cache = _CaptureCache()
+    service._response_cache = cache
+
+    service.generate_answer(
+        user_query="Will AI replace programmers?",
+        conversation_context="Previous messages:\nAssistant: Aviation restrictions were introduced.",
+        news_items=[
+            _make_news_item(
+                news_id=901,
+                source_name="CNews",
+                title="AI and developers",
+                content="AI tools automate routine coding tasks, while developers remain responsible for design.",
+            )
+        ],
+        intent="FACTUAL",
+    )
+
+    request = provider.requests[0]
+    assert request.user_prompt.startswith("Will AI replace programmers?")
+    assert "Previous messages:" in request.user_prompt
+    assert request.user_prompt.index("Will AI replace programmers?") < request.user_prompt.index("Previous messages:")
+    assert cache.get_calls[0]["query"] == "Will AI replace programmers?"
+    assert cache.set_calls[0]["query"] == "Will AI replace programmers?"
 
 
 def test_generate_answer_applies_second_llm_correction_when_quality_improves(monkeypatch) -> None:
@@ -299,6 +366,7 @@ def test_generate_digest_adds_digest_style_instruction() -> None:
     )
 
     assert "редакторский" in provider.requests[0].user_prompt
+    assert provider.requests[0].user_prompt.startswith("Составь большой новостной дайджест")
 
 
 def test_digest_correction_prompt_keeps_sources_in_metadata() -> None:
@@ -532,12 +600,14 @@ class _FakeChatSession:
 
 class _FakeChatService:
     def __init__(self) -> None:
+        self.user_messages: list[str] = []
         self.assistant_messages: list[str] = []
 
     def get_or_create_session(self, db_session, *, user_id, session_id=None, title=None):
         return _FakeChatSession()
 
     def save_user_message(self, db_session, *, session_id, content):
+        self.user_messages.append(content)
         return None
 
     def save_assistant_message(self, db_session, *, session_id, content, generation_log_id=None):
@@ -546,6 +616,45 @@ class _FakeChatService:
 
     def update_session_title(self, db_session, *, session_id, title):
         return None
+
+
+def test_generate_chat_answer_builds_memory_before_saving_current_question() -> None:
+    provider = _SequenceProvider(["AI will change developer work [Doc 1]."])
+    chat_service = _FakeChatService()
+
+    class _FakeMemoryService:
+        def refresh_summary_if_needed(self, db_session, session_id):
+            return ""
+
+        def build_memory_block(self, db_session, session_id):
+            assert chat_service.user_messages == []
+            return "Previous messages:\nAssistant: Aviation restrictions were introduced."
+
+    service = AnswerGenerationService(
+        provider=provider,
+        config=GenerationConfig(enable_logging=False, enable_correction=False),
+        chat_service=chat_service,
+        chat_memory_service=_FakeMemoryService(),
+    )
+    service._response_cache = _NoCache()
+
+    service.generate_chat_answer(
+        db_session=object(),
+        user_query="Will AI replace programmers?",
+        news_items=[
+            _make_news_item(
+                news_id=902,
+                source_name="CNews",
+                title="AI and developers",
+                content="AI tools automate routine coding tasks, while developers remain responsible for design.",
+            )
+        ],
+        user_id=1,
+    )
+
+    assert chat_service.user_messages == ["Will AI replace programmers?"]
+    assert provider.requests[0].user_prompt.startswith("Will AI replace programmers?")
+    assert "Previous messages:" in provider.requests[0].user_prompt
 
 
 def test_generate_chat_answer_crag_uses_retrieval_bridge(monkeypatch) -> None:

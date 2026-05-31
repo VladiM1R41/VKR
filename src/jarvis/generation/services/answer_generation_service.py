@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from jarvis.generation.services.chat_service import ChatService
 
+from jarvis.core.settings import get_settings
 from jarvis.generation.services.chat_memory_service import ChatMemoryService
 from jarvis.generation.services.citation_validator import CitationValidationResult, CitationValidator
 from jarvis.generation.services.confidence_service import compute_confidence as compute_confidence_label
@@ -136,13 +137,31 @@ class GenerationDigestResult:
 @dataclass
 class GenerationConfig:
     """Конфигурация генерации (переопределяет дефолты)."""
-    max_input_tokens: int = 20000       # лимит входного контекста
-    max_output_tokens: int = 1200       # лимит ответа
-    digest_max_output_tokens: int = 6500  # отдельный лимит для больших дайджестов
+    max_input_tokens: int = 100000      # лимит входного контекста
+    max_output_tokens: int | None = None  # None = не отправлять max_tokens
+    digest_max_output_tokens: int | None = None
     temperature: float = 0.2            # низкая для groundedness
     enable_logging: bool = True         # сохранять ли в generation_logs
     enable_correction: bool = True      # one extra LLM pass for failed quality checks
     correction_groundedness_threshold: float = 0.45
+
+    @classmethod
+    def from_settings(cls) -> "GenerationConfig":
+        settings = get_settings()
+        return cls(
+            max_input_tokens=settings.jarvis_llm_max_input_tokens,
+            max_output_tokens=(
+                settings.jarvis_llm_max_output_tokens
+                if settings.jarvis_llm_max_output_tokens > 0
+                else None
+            ),
+            digest_max_output_tokens=(
+                settings.jarvis_llm_digest_max_output_tokens
+                if settings.jarvis_llm_digest_max_output_tokens > 0
+                else None
+            ),
+            temperature=settings.jarvis_llm_temperature,
+        )
 
 
 # ───────────────────────────────────────────────────────────
@@ -264,7 +283,7 @@ class AnswerGenerationService:
         chat_memory_service: ChatMemoryService | None = None,
     ) -> None:
         self._provider = provider
-        self._config = config or GenerationConfig()
+        self._config = config or GenerationConfig.from_settings()
         self._chat_service = chat_service
         self._chat_memory_service = chat_memory_service
         self._response_cache = ResponseCache()
@@ -306,32 +325,30 @@ class AnswerGenerationService:
 
         # Шаг 1: определить режим
         mode = intent_to_mode(intent)
-        prompt_query = user_query
-        if conversation_context:
-            prompt_query = f"{conversation_context}\n\nТекущий вопрос пользователя:\n{user_query}"
 
         # Шаг 2: собрать контекст
         assembled = assemble_context_for_chat(
             news_items=news_items,
             max_input_tokens=self._config.max_input_tokens,
             system_prompt=self._get_system_prompt(mode),
-            user_query=prompt_query,
+            user_query=user_query,
         )
 
         # Шаг 3: построить промпт
         system_prompt = self._get_system_prompt(mode)
         prompt = build_prompt(
             mode=mode,
-            user_query=prompt_query,
+            user_query=user_query,
             documents=assembled.documents,
         )
+        prompt = self._attach_conversation_context(prompt, conversation_context)
 
         cache_doc_ids = [doc.news_id for doc in assembled.documents if doc.news_id is not None]
         provider_key, model_key = self._provider_cache_identity()
         cached = self._response_cache.get(
             mode=mode,
             rag_mode=rag_mode_override,
-            query=prompt_query,
+            query=user_query,
             document_ids=cache_doc_ids,
             prompt_version=_PROMPT_VERSION,
             provider_key=provider_key,
@@ -445,7 +462,7 @@ class AnswerGenerationService:
         self._response_cache.set(
             mode=mode,
             rag_mode=rag_mode_override,
-            query=prompt_query,
+            query=user_query,
             document_ids=cache_doc_ids,
             prompt_version=_PROMPT_VERSION,
             provider_key=provider_key,
@@ -517,14 +534,8 @@ class AnswerGenerationService:
             title=session_title,
         )
 
-        # 2. Сохранить сообщение пользователя
-        self._chat_service.save_user_message(
-            db_session,
-            session_id=chat_session.id,
-            content=user_query,
-        )
-
-        # 3. Сгенерировать ответ (диспетчер RAG-режимов)
+        # 2. Собрать память до сохранения текущего сообщения, чтобы история
+        # не дублировала новый вопрос и не подменяла его в prompt.
         conversation_context = ""
         if self._chat_memory_service is not None:
             self._chat_memory_service.refresh_summary_if_needed(db_session, chat_session.id)
@@ -533,6 +544,14 @@ class AnswerGenerationService:
                 chat_session.id,
             )
 
+        # 3. Сохранить сообщение пользователя
+        self._chat_service.save_user_message(
+            db_session,
+            session_id=chat_session.id,
+            content=user_query,
+        )
+
+        # 4. Сгенерировать ответ (диспетчер RAG-режимов)
         retrieval_fn = None
         if rag_mode_override in {"crag", "self_rag"}:
             from jarvis.generation.services.retrieval_bridge import RetrievalBridge
@@ -592,7 +611,7 @@ class AnswerGenerationService:
                 rag_mode_override=rag_mode_override,
             )
 
-        # 4. Сохранить ответ ассистента
+        # 5. Сохранить ответ ассистента
         if result.generation_log_id is not None:
             self._chat_service.save_assistant_message(
                 db_session,
@@ -608,7 +627,7 @@ class AnswerGenerationService:
                 content=result.answer_text,
             )
 
-        # 5. Обновить заголовок если сессия новая
+        # 6. Обновить заголовок если сессия новая
         if was_new_session and session_title is None:
             # Берём первые 50 символов вопроса как заголовок
             auto_title = user_query[:50] + ("..." if len(user_query) > 50 else "")
@@ -661,18 +680,19 @@ class AnswerGenerationService:
 
         # Шаг 2: построить промпт
         system_prompt = self._get_system_prompt(mode)
-        user_query = ""
+        prompt_parts: list[str] = []
         if continuity_context:
-            user_query = (
+            prompt_parts.append(
                 f"Учти также, что в предыдущих дайджестах было:\n{continuity_context}\n\n"
             )
-        if digest_style:
-            user_query += self._digest_style_instruction(digest_style) + "\n\n"
-        user_query += (
+        prompt_parts.append(
             f"Составь большой новостной дайджест из {len(assembled.documents)} источников ниже. "
             "Используй доступные материалы широко: не ограничивайся несколькими предложениями, "
             "выделяй тематические блоки и показывай связи между событиями там, где они подтверждаются источниками."
         )
+        if digest_style:
+            prompt_parts.append(self._digest_style_instruction(digest_style))
+        user_query = "\n\n".join(part.strip() for part in prompt_parts if part.strip())
 
         prompt = build_prompt(
             mode=mode,
@@ -976,6 +996,27 @@ class AnswerGenerationService:
         """Получить системный промпт для режима."""
         from jarvis.generation.services.prompt_builder import _MODE_SYSTEM
         return _MODE_SYSTEM[mode]
+
+    @staticmethod
+    def _attach_conversation_context(
+        prompt: PromptResult,
+        conversation_context: str,
+    ) -> PromptResult:
+        """Add chat memory without turning it into the current user query."""
+        memory = conversation_context.strip()
+        if not memory:
+            return prompt
+
+        memory_block = (
+            "Контекст предыдущего диалога ниже нужен только для связности ответа. "
+            "Не считай его новым вопросом и не заменяй им текущий запрос пользователя.\n"
+            f"{memory}"
+        )
+        return PromptResult(
+            system_prompt=prompt.system_prompt,
+            context_block=prompt.context_block,
+            user_prompt=f"{prompt.user_prompt}\n\n{memory_block}",
+        )
 
     def _evaluate_generation_quality(
         self,
